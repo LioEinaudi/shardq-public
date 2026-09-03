@@ -1,0 +1,39 @@
+TaskName: "{TASK_NAME}"
+Description: "{DESCRIPTION}"
+Tags: ["shardq"]
+Entrypoint: >-
+  {ENTRYPOINT}
+UserCodePath: ""
+RemoteMountCodePath: ""
+Envs: []
+ResourceQueueID: "{QUEUE}"
+Framework: "Custom"
+TaskRoleSpecs:
+  - RoleName: "worker"
+    RoleReplicas: 1
+    Flavor: "{FLAVOR}"
+ActiveDeadlineSeconds: {ACTIVE_DEADLINE}
+EnableTensorBoard: false
+Storages:
+  - Type: "Vepfs"
+    MountPath: "/mlp_vepfs/share"
+    VepfsId: "{VEPFS_ID}"
+    SubPath: "share"
+ImageUrl: "{IMAGE}"
+CacheType: "Cloudfs"
+RetryOptions:
+  EnableRetry: false
+  MaxRetryTimes: 0
+  IntervalSeconds: 120
+  PolicySets: []
+  EnableReserveResourceOnRetry: false
+DiagOptions:
+  - Name: "EnvironmentalDiagnosis"
+    Enable: false
+  - Name: "PythonDetection"
+    Enable: false
+  - Name: "LogDetection"
+    Enable: false
+Priority: {PRIORITY}
+AccessType: "Private"
+Preemptible: {PREEMPTIBLE}

@@ -1,0 +1,27 @@
+{
+  "job_id": "fake-demo",
+  "backend": "fake",
+  "pool": "local-fake",
+  "protocol_id": "x_fake_v1",
+  "priority": 0,
+  "backend_args": {
+    "partitions": {"p0": 40, "p1": 24},
+    "unit_seconds": 0.05,
+    "poison_units": {"p1": [7]}
+  },
+  "shard": {
+    "target_seconds": 1,
+    "min_units": 2,
+    "max_units": 8,
+    "limit_units": null,
+    "lookahead": 3
+  },
+  "retry": {
+    "max_errors": 2,
+    "max_preemptions": 20,
+    "backoff_seconds": 0,
+    "bisect": true,
+    "lease_ttl_seconds": 5
+  },
+  "traits": {}
+}

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shardq"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+shardq = "shardq.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["shardq*"]
+
+[tool.setuptools.package-data]
+shardq = ["templates/*.tmpl"]

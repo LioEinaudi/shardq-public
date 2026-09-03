@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "pools": {
+    "local-fake": {
+      "backend": "fake",
+      "entry": "",
+      "launcher": "local",
+      "volc": {},
+      "env": {},
+      "local_python": null,
+      "max_workers": 3,
+      "worker_max_wall_seconds": 600,
+      "worker_idle_exit_seconds": 5,
+      "extra": {
+        "column": "X"
+      }
+    },
+    "volc-lmms": {
+      "backend": "lmms_eval",
+      "entry": "/absolute/path/to/lmms-worker.sh",
+      "launcher": "volc",
+      "volc": {
+        "queue": "q-placeholder",
+        "flavor": "ml.pni3ln.4xlarge",
+        "gpu_slots": 1,
+        "image": "registry.example/image:tag",
+        "preemptible": true,
+        "priority": 4,
+        "vepfs_id": "vepfs-placeholder",
+        "capacity_mode": "probe",
+        "max_queued": 1
+      },
+      "env": {
+        "SHARDQ_PYTHON": "/absolute/path/to/python"
+      },
+      "local_python": "/absolute/path/to/python",
+      "max_workers": 1,
+      "worker_max_wall_seconds": 14400,
+      "worker_idle_exit_seconds": 300,
+      "extra": {
+        "lmms_root": "/absolute/path/to/lmms-eval",
+        "column": "E"
+      }
+    }
+  }
+}
