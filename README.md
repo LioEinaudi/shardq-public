@@ -92,3 +92,17 @@ backend is convenient for command-line adapters.
 A cloud launcher subclasses `shardq.launchers.base.Launcher` and implements
 `submit`, `status`, and `kill`; implement `capacity_slots` when the cloud
 has auditable capacity. Add its name to `shardq.launchers.get_launcher`.
+
+## Agent skill
+
+The repository ships an [Agent Skill](https://agentskills.io) at
+`.agents/skills/shardq/` (`.claude/skills/shardq` is a symlink to it). Codex and
+Claude Code discover it automatically when started inside this checkout, and it teaches
+either agent how to register jobs, run the scheduler, read the ledger, triage failures,
+and adapt a new benchmark. To use it from other directories, link it into the user-level
+skill roots:
+
+```bash
+ln -sfn "$PWD/.agents/skills/shardq" ~/.codex/skills/shardq
+ln -sfn "$PWD/.agents/skills/shardq" ~/.claude/skills/shardq
+```
