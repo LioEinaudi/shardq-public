@@ -30,7 +30,8 @@ then `$SHARDQ_POOLS`, then `<root>/pools.json`, else error. Any `ValueError`,
 - Holds a non-blocking `flock` on `<root>/scheduler/lock`; exits 3 if another scheduler
   holds it.
 - Handles only jobs whose pool uses the selected launcher. Default is `volc`.
-- One tick, in order: refresh worker statuses through the launcher; expire leases;
+- One tick, in order: refresh worker statuses through the launcher (workers already in a
+  `terminal:*` state are not polled again; live ones are polled with 8 threads); expire leases;
   bisect or quarantine shards over `max_errors` or `max_preemptions`; update the runtime
   EMA in `history.json`; cut new shards while pending plus backoff shards are below
   `shard.lookahead`; merge partitions whose shards are all done, superseded, or

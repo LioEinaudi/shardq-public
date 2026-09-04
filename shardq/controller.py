@@ -7,6 +7,7 @@ import math
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 from typing import Dict
@@ -23,6 +24,7 @@ from .spec import PoolSpec, load_pools, resolve_pools_path, slug
 LOGGER = logging.getLogger("shardq.controller")
 _LAUNCHERS = {}
 _LOG_ROOT = None
+STATUS_THREADS = 8
 
 
 def _package_root() -> Path:
@@ -56,6 +58,7 @@ def _last_failure_reason(shard_dir: Path) -> str:
 
 def _refresh_workers(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], now: float) -> Dict[str, dict]:
     workers = {}
+    pending = []
     for path in _worker_files(root):
         row = read_json(path, {})
         if not isinstance(row, dict) or row.get("launcher") != launcher_name:
@@ -64,8 +67,18 @@ def _refresh_workers(root: Path, launcher_name: str, pools: Dict[str, PoolSpec],
         if pool_name not in pools or pools[pool_name].launcher != launcher_name:
             continue
         handle = str(row.get("handle", ""))
+        if row.get("dead") and str(row.get("last_status", "")).startswith("terminal:"):
+            # Terminal launcher states are final: keep the recorded row and skip the
+            # launcher call so tick time does not grow with worker history.
+            workers[handle] = row
+            continue
+        launcher = _launcher(root, launcher_name, pools[pool_name])
+        pending.append((path, row, handle, launcher))
+
+    def refresh(item):
+        path, row, handle, launcher = item
         try:
-            status = _launcher(root, launcher_name, pools[pool_name]).status(handle)
+            status = launcher.status(handle)
             row.pop("status_error", None)
         except Exception as exc:
             status = str(row.get("last_status", "unknown"))
@@ -74,7 +87,12 @@ def _refresh_workers(root: Path, launcher_name: str, pools: Dict[str, PoolSpec],
         row["dead"] = status.startswith("terminal:")
         row["last_checked_unix"] = now
         atomic_write_json(path, row)
-        workers[handle] = row
+        return handle, row
+
+    if pending:
+        with ThreadPoolExecutor(max_workers=min(STATUS_THREADS, len(pending))) as executor:
+            for handle, row in executor.map(refresh, pending):
+                workers[handle] = row
     return workers
 
 
@@ -181,7 +199,9 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
     ledger = Ledger(root)
     actions = []
     warnings = []
+    tick_started = time.time()
     workers = _refresh_workers(root, launcher_name, pools, now)
+    workers_polled = sum(1 for row in workers.values() if row.get("last_checked_unix") == now)
     relevant_pool_names = {name for name, pool in pools.items() if pool.launcher == launcher_name}
     job_ids = [
         job_id
@@ -341,6 +361,8 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
         "actions": actions,
         "warnings": warnings,
         "pool_backoff": dict(backoff),
+        "workers_polled": workers_polled,
+        "tick_seconds": round(time.time() - tick_started, 3),
     }
     atomic_write_json(root / "scheduler" / "state.json", state)
     _write_status(root, state)
@@ -400,7 +422,13 @@ def run_scheduler(
             opts.setdefault("_pool_backoff", dict(previous.get("pool_backoff") or {}))
         while True:
             state = tick(root, launcher_name, pools, opts, time.time())
-            LOGGER.info("tick actions=%d warnings=%d", len(state["actions"]), len(state["warnings"]))
+            LOGGER.info(
+                "tick actions=%d warnings=%d workers_polled=%d seconds=%.1f",
+                len(state["actions"]),
+                len(state["warnings"]),
+                int(state.get("workers_polled", 0)),
+                float(state.get("tick_seconds", 0.0)),
+            )
             if once:
                 return 0
             if exit_when_idle:

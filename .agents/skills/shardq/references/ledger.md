@@ -59,6 +59,12 @@ unix time, not the file mtime. Records in an attempt are only trusted after
 
 ## Triage recipes
 
+Ticks are slow
+: the log line carries `workers_polled` and `seconds`. Polling cost is one launcher call per
+live worker; the loop is tick time plus `--poll-seconds`, so a short poll only helps once
+the tick itself is short. Submits are the other cost: lower `--max-submits-per-tick` if
+one tick must stay under the poll interval.
+
 Nothing is being submitted
 : `state.json` `warnings` names the reason (submit failure, merge failure, unknown pool).
 `pool_backoff` shows a pool parked for 300 s after a failed submit. Demand is zero when
