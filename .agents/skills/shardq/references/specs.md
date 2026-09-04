@@ -11,7 +11,7 @@ Both files are JSON objects. Validation lives in `shardq/spec.py`; the examples 
 | `backend` | string | must equal the pool's backend |
 | `pool` | string | key in the pools file |
 | `protocol_id` | string | required, carried into markers and publish output |
-| `priority` | int | higher claims first; default 0 |
+| `priority` | int | default 0; higher wins at claim time after partition and session locality (see SKILL.md, concurrency) |
 | `backend_args` | object | backend specific, see below |
 | `shard` | object | cutting parameters |
 | `retry` | object | failure handling |

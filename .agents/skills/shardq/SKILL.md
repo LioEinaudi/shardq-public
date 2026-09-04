@@ -21,6 +21,23 @@ description: Use when asked to run, monitor, debug, or extend ShardQ, the filesy
 - Every job carries a `protocol_id`. ShardQ never changes protocol identity; it only
   splits execution and re-aggregates records.
 
+## How concurrency is capped
+
+- Caps are per pool and shared by every job registered on that pool. Nothing limits how
+  many jobs may be registered at once.
+- Each tick submits `min(demand - live, pool.max_workers - live, --max-submits-per-tick)`
+  workers, where live counts queued plus running workers and demand is pending shards
+  plus estimated uncut shards. Volc probe mode additionally keeps at most
+  `volc.max_queued` workers waiting in the queue; running workers no longer count. So
+  `max_workers` is the GPU ceiling and `max_queued` only bounds unstarted tasks.
+- Which job a worker serves is decided at claim time, in this order: same partition as
+  its last shard, same `session_key` (model already loaded), higher job `priority`, fewer
+  remaining shards, shards without prior failures, lower start unit. A worker with a
+  loaded model keeps draining that model's jobs even when a higher-priority job with a
+  different `session_key` appears; only a fresh worker follows priority first. Equal
+  priorities interleave. To serialize benchmarks, `shardq stop` the ones that must wait
+  or give them distinct priorities.
+
 ## Preflight, every session
 
 1. The checkout is the directory containing this skill (`shardq/`, `examples/`,
