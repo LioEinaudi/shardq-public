@@ -62,8 +62,8 @@ priority settings under `volc`. In `probe` mode, `max_queued` limits queued
 workers. In `audit` mode, also set `creator` and `gpu_cap`; ShardQ sums
 non-terminal requested GPU slots before submitting.
 
-Use the [MMStar smoke job](examples/lmms-mmstar-smoke.json) with the
-Volc pool in [the example configuration](examples/pools.example.json).
+The [Volc deployment template](examples/deployments/volc-lmms/) includes
+a configurable pool, six example job specs and their protocol descriptions.
 
 ## Optional lmms backend
 

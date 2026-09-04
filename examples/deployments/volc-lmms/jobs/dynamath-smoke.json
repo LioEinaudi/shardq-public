@@ -1,12 +1,12 @@
 {
-  "job_id": "example-mmstar-smoke",
+  "job_id": "example-dynamath-smoke",
   "backend": "lmms_eval",
   "pool": "volc-lmms",
-  "protocol_id": "example-mmstar-v1",
-  "priority": 0,
+  "protocol_id": "example-dynamath-v1",
+  "priority": 10,
   "backend_args": {
     "tasks": [
-      "mmstar"
+      "dynamath"
     ],
     "model": "qwen2_5_vl",
     "model_args": "pretrained=/absolute/path/to/model",
@@ -27,5 +27,9 @@
     "backoff_seconds": 60,
     "lease_ttl_seconds": 1800
   },
-  "traits": {}
+  "traits": {
+    "dynamath": {
+      "max_parallel": 2
+    }
+  }
 }

@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "protocols": [
+    {
+      "id": "example-dynamath-v1",
+      "task": "dynamath",
+      "model": "qwen2_5_vl",
+      "gen_kwargs": "max_new_tokens=128,do_sample=False",
+      "units_per_shard": 4
+    },
+    {
+      "id": "example-videomme-v1",
+      "task": "videomme",
+      "model": "qwen2_5_vl",
+      "gen_kwargs": "max_new_tokens=128,do_sample=False",
+      "units_per_shard": 1
+    },
+    {
+      "id": "example-mlvu-v1",
+      "task": "mlvu_dev",
+      "model": "qwen2_5_vl",
+      "gen_kwargs": "max_new_tokens=128,do_sample=False",
+      "units_per_shard": 1
+    },
+    {
+      "id": "example-lvbench-v1",
+      "task": "lvbench",
+      "model": "qwen2_5_vl",
+      "gen_kwargs": "max_new_tokens=128,do_sample=False",
+      "units_per_shard": 1
+    }
+  ]
+}

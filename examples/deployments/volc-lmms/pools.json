@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "pools": {
+    "volc-lmms": {
+      "backend": "lmms_eval",
+      "entry": "/absolute/path/to/shardq-public/examples/lmms-worker.sh",
+      "launcher": "volc",
+      "volc": {
+        "queue": "q-placeholder",
+        "flavor": "ml.pni3ln.4xlarge",
+        "gpu_slots": 1,
+        "image": "registry.example/image:tag",
+        "preemptible": true,
+        "priority": 4,
+        "vepfs_id": "vepfs-placeholder",
+        "capacity_mode": "probe",
+        "max_queued": 1
+      },
+      "env": {
+        "SHARDQ_PYTHON": "/absolute/path/to/worker-python"
+      },
+      "local_python": "/absolute/path/to/control-python",
+      "max_workers": 2,
+      "worker_max_wall_seconds": 14400,
+      "worker_idle_exit_seconds": 300,
+      "extra": {
+        "lmms_root": "/absolute/path/to/lmms-eval",
+        "column": "example"
+      }
+    }
+  }
+}

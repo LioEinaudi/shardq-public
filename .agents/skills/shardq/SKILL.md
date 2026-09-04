@@ -134,8 +134,8 @@ Run `python -m unittest discover -s tests -v` afterwards.
 ## Deployment examples
 
 - Run the local demo with `examples/fake-demo.json` and `examples/pools.example.json`.
-- For a Volc smoke job, adapt `examples/lmms-mmstar-smoke.json` and the Volc pool in
-  `examples/pools.example.json` to your deployment.
+- For Volc pools, adapt `examples/deployments/volc-lmms/` to the shared filesystem,
+  runtime and resource IDs available to the deployment.
 - Run the tests with `python -m unittest discover -s tests -v`. The optional MMStar
   merge test reads `SHARDQ_TEST_LMMS_PYTHON`, `SHARDQ_TEST_LMMS_ROOT` and
   `SHARDQ_TEST_LMMS_FIXTURE_DIR`. Supply a fixture directory containing one

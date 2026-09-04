@@ -1,0 +1,34 @@
+{
+  "job_id": "example-dynamath-full",
+  "backend": "lmms_eval",
+  "pool": "volc-lmms",
+  "protocol_id": "example-dynamath-v1",
+  "priority": 0,
+  "backend_args": {
+    "tasks": [
+      "dynamath"
+    ],
+    "model": "qwen2_5_vl",
+    "model_args": "pretrained=/absolute/path/to/model",
+    "gen_kwargs": "max_new_tokens=128,do_sample=False",
+    "batch_size": 1
+  },
+  "shard": {
+    "target_seconds": 300,
+    "min_units": 4,
+    "max_units": 4,
+    "lookahead": 2
+  },
+  "retry": {
+    "max_errors": 3,
+    "max_preemptions": 10,
+    "bisect": true,
+    "backoff_seconds": 60,
+    "lease_ttl_seconds": 1800
+  },
+  "traits": {
+    "dynamath": {
+      "max_parallel": 2
+    }
+  }
+}
