@@ -393,16 +393,34 @@ class LmmsEvalBackend(Backend):
             datetime_str=None,
         )
 
-    def _aggregate_rows(self, partition: Partition, records: List[dict]) -> Tuple[dict, dict]:
-        self._configure_path()
-        from lmms_eval.evaluator_utils import get_task_list
-        from lmms_eval.tasks import TaskManager, get_task_dict
+    def _aggregate_rows(
+        self,
+        partition: Partition,
+        records: List[dict],
+        bootstrap_iters: Optional[int] = None,
+        task_output=None,
+    ) -> Tuple[dict, dict, object]:
+        """Aggregate records with the task's own aggregation.
 
-        manager = TaskManager("INFO", model_name=self.model or None)
-        outputs = get_task_list(get_task_dict([partition.name], task_manager=manager))
-        if len(outputs) != 1:
-            raise ValueError(f"partition {partition.name!r} resolved to {len(outputs)} leaf tasks")
-        task_output = outputs[0]
+        Pass ``task_output`` from a previous call to skip rebuilding the task
+        (and reloading its dataset); its metric containers are reset here.
+        ``bootstrap_iters`` overrides the backend default, use 0 to skip stderr.
+        """
+        self._configure_path()
+        import collections
+
+        if task_output is None:
+            from lmms_eval.evaluator_utils import get_task_list
+            from lmms_eval.tasks import TaskManager, get_task_dict
+
+            manager = TaskManager("INFO", model_name=self.model or None)
+            outputs = get_task_list(get_task_dict([partition.name], task_manager=manager))
+            if len(outputs) != 1:
+                raise ValueError(f"partition {partition.name!r} resolved to {len(outputs)} leaf tasks")
+            task_output = outputs[0]
+        else:
+            task_output.sample_metrics = collections.defaultdict(list)
+            task_output.agg_metrics = collections.defaultdict(list)
         task_output.task.args = self._cli_args(partition.name, 0, len(records), "")
         aggregation = task_output.task.aggregation()
         filters = sorted({str(row.get("filter", "none")) for row in records}) or ["none"]
@@ -415,7 +433,9 @@ class LmmsEvalBackend(Backend):
                 ]
                 if values:
                     task_output.sample_metrics[(metric, filter_key)] = values
-        task_output.calculate_aggregate_metric(bootstrap_iters=self.bootstrap_iters)
+        task_output.calculate_aggregate_metric(
+            bootstrap_iters=self.bootstrap_iters if bootstrap_iters is None else int(bootstrap_iters)
+        )
         alias = task_output.task_alias or partition.name
         task_results = dict(task_output.agg_metrics)
         task_results["alias"] = alias
@@ -428,14 +448,14 @@ class LmmsEvalBackend(Backend):
             },
             "group_subtasks": {},
         }
-        return payload, _public_scalars(task_results)
+        return payload, _public_scalars(task_results), task_output
 
     def merge(self, partition: Partition, records: List[dict], out_dir: Path, meta: dict) -> dict:
         self._configure_path()
         from lmms_eval.utils import handle_non_serializable
 
         out_dir.mkdir(parents=True, exist_ok=True)
-        payload, metrics = self._aggregate_rows(partition, records)
+        payload, metrics, task_output = self._aggregate_rows(partition, records)
         serializable = json.loads(json.dumps(payload, ensure_ascii=False, default=handle_non_serializable))
         atomic_write_json(out_dir / "results.json", serializable)
         mismatches = []
@@ -450,7 +470,11 @@ class LmmsEvalBackend(Backend):
                 for line in Path(records_path).read_text(encoding="utf-8").splitlines()
                 if line.strip()
             ]
-            _, shard_metrics = self._aggregate_rows(partition, shard_rows)
+            # Public scalars never include stderr, so skip the bootstrap and reuse
+            # the task object: a full-size partition has hundreds of shards.
+            _, shard_metrics, _ = self._aggregate_rows(
+                partition, shard_rows, bootstrap_iters=0, task_output=task_output
+            )
             raw = json.loads(Path(raw_path).read_text(encoding="utf-8"))
             expected = _public_scalars((raw.get("results") or {}).get(partition.name, {}))
             checked += 1

@@ -25,6 +25,8 @@ LOGGER = logging.getLogger("shardq.controller")
 _LAUNCHERS = {}
 _LOG_ROOT = None
 STATUS_THREADS = 8
+MERGE_THREADS = 2
+MERGE_RETRY_SECONDS = 600
 
 
 def _package_root() -> Path:
@@ -94,6 +96,22 @@ def _refresh_workers(root: Path, launcher_name: str, pools: Dict[str, PoolSpec],
             for handle, row in executor.map(refresh, pending):
                 workers[handle] = row
     return workers
+
+
+def _merge_executor(opts: dict) -> ThreadPoolExecutor:
+    executor = opts.get("_merge_executor")
+    if executor is None:
+        executor = ThreadPoolExecutor(max_workers=MERGE_THREADS, thread_name_prefix="shardq-merge")
+        opts["_merge_executor"] = executor
+    return executor
+
+
+def _run_merge(root: Path, job, partition: str, pool: PoolSpec, allow_partial: bool) -> dict:
+    try:
+        return merge_partition(root, job, partition, pool, allow_partial, time.time())
+    except Exception:
+        LOGGER.exception("merge failed for %s:%s", job.job_id, partition)
+        raise
 
 
 def _update_history(root: Path, jobs: list, now: float, actions: list) -> None:
@@ -255,6 +273,29 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
                 shard_id = ledger.cut(job_id, partition.name, count, count * partition.unit_seconds_est, now)
                 actions.append({"action": "cut", "job_id": job_id, "partition": partition.name, "shard_id": shard_id, "count": count})
 
+    # Merges run in background threads so a slow aggregation never stalls the tick.
+    merges = opts.setdefault("_merges", {})
+    merge_retry_after = opts.setdefault("_merge_retry_after", {})
+    for key, entry in list(merges.items()):
+        future = entry["future"]
+        if not future.done():
+            continue
+        merges.pop(key)
+        try:
+            report = future.result()
+            actions.append(
+                {
+                    "action": "merge",
+                    "job_id": key[0],
+                    "partition": key[1],
+                    "missing_units": report["missing_units"],
+                    "seconds": round(now - entry["started_unix"], 1),
+                }
+            )
+        except Exception as exc:
+            merge_retry_after[key] = now + MERGE_RETRY_SECONDS
+            warnings.append(f"{key[0]}:{key[1]}: merge failed: {type(exc).__name__}: {exc}")
+
     for job_id in job_ids:
         job = ledger.scan_job(job_id, now)
         pool = pools[job.pool]
@@ -263,16 +304,18 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
             ready = partition.next_cut == partition.size and bool(partition.shards) and all(shard.state in terminal_states for shard in partition.shards)
             if not ready or partition.status in {"merged", "partial"}:
                 continue
+            key = (job_id, name)
+            if key in merges or float(merge_retry_after.get(key, 0)) > now:
+                continue
             has_missing = partition.quarantined_units > 0
             if opts.get("require_complete") and has_missing:
                 warnings.append(f"{job_id}:{name}: {partition.quarantined_units} quarantined units prevent complete merge")
                 continue
-            try:
-                report = merge_partition(root, job, name, pool, not bool(opts.get("require_complete")), now)
-                actions.append({"action": "merge", "job_id": job_id, "partition": name, "missing_units": report["missing_units"]})
-            except Exception as exc:
-                warnings.append(f"{job_id}:{name}: merge failed: {type(exc).__name__}: {exc}")
-                LOGGER.exception("merge failed for %s:%s", job_id, name)
+            future = _merge_executor(opts).submit(
+                _run_merge, root, job, name, pool, not bool(opts.get("require_complete"))
+            )
+            merges[key] = {"future": future, "started_unix": now}
+            actions.append({"action": "merge_start", "job_id": job_id, "partition": name})
 
     backoff = opts.setdefault("_pool_backoff", {})
     current_jobs = [ledger.scan_job(job_id, now) for job_id in job_ids]
@@ -363,6 +406,10 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
         "pool_backoff": dict(backoff),
         "workers_polled": workers_polled,
         "tick_seconds": round(time.time() - tick_started, 3),
+        "merges_in_flight": [
+            {"job_id": key[0], "partition": key[1], "started_unix": entry["started_unix"]}
+            for key, entry in sorted(merges.items())
+        ],
     }
     atomic_write_json(root / "scheduler" / "state.json", state)
     _write_status(root, state)
@@ -423,10 +470,11 @@ def run_scheduler(
         while True:
             state = tick(root, launcher_name, pools, opts, time.time())
             LOGGER.info(
-                "tick actions=%d warnings=%d workers_polled=%d seconds=%.1f",
+                "tick actions=%d warnings=%d workers_polled=%d merges=%d seconds=%.1f",
                 len(state["actions"]),
                 len(state["warnings"]),
                 int(state.get("workers_polled", 0)),
+                len(state.get("merges_in_flight", [])),
                 float(state.get("tick_seconds", 0.0)),
             )
             if once:

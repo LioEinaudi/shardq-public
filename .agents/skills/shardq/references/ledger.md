@@ -65,6 +65,12 @@ live worker; the loop is tick time plus `--poll-seconds`, so a short poll only h
 the tick itself is short. Submits are the other cost: lower `--max-submits-per-tick` if
 one tick must stay under the poll interval.
 
+A partition stays `cut` after all shards are done
+: a merge is in flight (`merges_in_flight` in `state.json`, log line `merges=N`). The
+lmms merge re-aggregates once with bootstrap stderr (about 2 min for 5000 records) and
+then self-checks every shard without bootstrap; hundreds of shards take under a minute.
+If it runs much longer, read the merge traceback in `scheduler.log`.
+
 Nothing is being submitted
 : `state.json` `warnings` names the reason (submit failure, merge failure, unknown pool).
 `pool_backoff` shows a pool parked for 300 s after a failed submit. Demand is zero when
@@ -99,7 +105,7 @@ Scheduler will not start (exit 3)
 one first; never run two against one root.
 
 Merge failed
-: the scheduler retries on every tick and logs the traceback in `scheduler.log`. For the
+: the scheduler retries after 600 s and logs the traceback in `scheduler.log`. For the
 lmms backend the usual cause is the merge interpreter (`pool.local_python`) missing the
 canonical tree; for the script backend it is `merge_command` not producing
 `results.json`.

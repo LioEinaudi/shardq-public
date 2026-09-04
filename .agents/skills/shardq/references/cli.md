@@ -34,8 +34,10 @@ then `$SHARDQ_POOLS`, then `<root>/pools.json`, else error. Any `ValueError`,
   `terminal:*` state are not polled again; live ones are polled with 8 threads); expire leases;
   bisect or quarantine shards over `max_errors` or `max_preemptions`; update the runtime
   EMA in `history.json`; cut new shards while pending plus backoff shards are below
-  `shard.lookahead`; merge partitions whose shards are all done, superseded, or
-  quarantined; submit workers.
+  `shard.lookahead`; start a background merge (2 threads) for partitions whose shards
+  are all done, superseded, or quarantined, and collect finished ones; submit workers.
+  A merge never blocks the tick; a failed merge is retried after 600 s and listed in
+  `warnings`. `state.json` lists `merges_in_flight`.
 - Submission count per pool is `min(demand - live, pool.max_workers - live,
   --max-submits-per-tick)`, where demand is pending shards plus estimated uncut shards.
   Volc `capacity_mode: probe` additionally caps queued workers at `volc.max_queued`;
