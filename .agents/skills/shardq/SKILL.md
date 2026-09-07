@@ -85,6 +85,9 @@ Order of checks when something looks stuck:
 
 1. Scheduler alive? `tmux ls`; `updated_unix` in `<root>/scheduler/state.json` must move
    every poll. Exit code 3 means another scheduler holds `scheduler/lock`.
+   If `updated_unix` stops moving but `scheduler.log` keeps updating, run
+   `grep "tick failed" <root>/scheduler/log/scheduler.log`; tick exceptions are
+   logged there with tracebacks and the loop keeps retrying.
 2. `warnings` and `pool_backoff` in `state.json`: a failed submit backs a pool off 300 s.
 3. Workers table in `shardq status`: `queued` on Volc means waiting for idle GPUs. `terminal:*` rows are normal
    after preemption or wall clock; the scheduler resubmits while demand exists.

@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import os
+import shutil
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from shardq.cutter import plan_cut
-from shardq.ledger import Ledger, ShardState, atomic_write_json, shard_state
+from shardq.ledger import Ledger, ShardState, _atomic_write_text, atomic_write_json, read_json, shard_state
 
 
 def _competing_claim(root: str, ready, queue) -> None:
@@ -38,6 +43,71 @@ class LedgerTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_read_json_returns_default_when_file_vanishes_after_is_file(self) -> None:
+        path = self.root / "vanished.json"
+        with patch.object(Path, "is_file", return_value=True):
+            self.assertEqual(read_json(path, {"x": 1}), {"x": 1})
+
+    def test_read_json_returns_default_for_partial_content(self) -> None:
+        path = self.root / "partial.json"
+        for content in ('{"a":', ""):
+            with self.subTest(content=content):
+                path.write_text(content, encoding="utf-8")
+                self.assertEqual(read_json(path, {"x": 1}), {"x": 1})
+        path.write_bytes(b'\xff')
+        self.assertEqual(read_json(path, {"x": 1}), {"x": 1})
+        atomic_write_json(path, {"a": 2})
+        self.assertEqual(read_json(path, {"x": 1}), {"a": 2})
+
+    def test_scan_job_survives_concurrent_lease_release(self) -> None:
+        partition_dir = self.ledger.job_dir("job") / "partitions" / "p"
+        metadata = read_json(partition_dir / "partition.json")
+        metadata["size"] = 40
+        atomic_write_json(partition_dir / "partition.json", metadata)
+        leases = [
+            partition_dir / "shards" / self.ledger.cut("job", "p", 1, 1.0, 100.0) / "lease"
+            for _ in range(40)
+        ]
+        stop = threading.Event()
+        errors = []
+        releases = [0, 0]
+
+        def churn_leases(index: int) -> None:
+            owner = {
+                "attempt_id": "a", "worker_id": f"w-{index}",
+                "handle": f"local:{index}", "acquired_unix": 1.0,
+            }
+            try:
+                while not stop.is_set():
+                    for lease in leases[index * 20:(index + 1) * 20]:
+                        if stop.is_set():
+                            return
+                        os.mkdir(lease)
+                        atomic_write_json(lease / "owner.json", owner)
+                        _atomic_write_text(lease / "heartbeat", "1.0\n")
+                        shutil.rmtree(lease, ignore_errors=True)
+                        releases[index] += 1
+            except Exception as error:
+                errors.append(error)
+                stop.set()
+
+        threads = [threading.Thread(target=churn_leases, args=(index,)) for index in range(2)]
+        for thread in threads:
+            thread.start()
+        scans = 0
+        try:
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline and not stop.is_set():
+                self.ledger.scan_job("job", time.time())
+                scans += 1
+        finally:
+            stop.set()
+            for thread in threads:
+                thread.join()
+        self.assertEqual(errors, [])
+        self.assertGreater(scans, 0)
+        self.assertTrue(all(count > 0 for count in releases))
 
     def test_shard_state_all_six_and_precedence(self) -> None:
         shard = self.root / "states" / "s"

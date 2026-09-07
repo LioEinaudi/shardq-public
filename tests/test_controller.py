@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from shardq import controller
 from shardq.launchers.base import TransientSubmitError
@@ -260,6 +262,66 @@ class CutAndSubmitTest(unittest.TestCase):
         state = controller.tick(self.root, "local", self.pools, self.opts, now + 1)
         self.assertEqual(len(self.stub.calls), 4)
         self.assertEqual(state["workers_submitted"], 1)
+
+
+class RunSchedulerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.old_handlers = controller.LOGGER.handlers[:]
+        self.old_level = controller.LOGGER.level
+        self.old_log_root = controller._LOG_ROOT
+        controller.LOGGER.handlers = []
+        controller._LOG_ROOT = None
+
+    def tearDown(self) -> None:
+        for handler in controller.LOGGER.handlers:
+            handler.close()
+        controller.LOGGER.handlers = self.old_handlers
+        controller.LOGGER.setLevel(self.old_level)
+        controller._LOG_ROOT = self.old_log_root
+
+    def test_run_scheduler_logs_and_continues_after_tick_exception(self) -> None:
+        idle_state = {
+            "jobs": [], "workers": [], "actions": [], "warnings": [], "merges_in_flight": [],
+            "workers_polled": 0, "shards_cut": 0, "workers_submitted": 0, "tick_seconds": 0.0,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            # Configure first so run_scheduler does not replace assertLogs' handler.
+            controller._configure_logging(root)
+            file_handler = next(
+                handler for handler in controller.LOGGER.handlers if isinstance(handler, logging.FileHandler)
+            )
+            with patch.object(controller, "tick", side_effect=[RuntimeError("boom"), idle_state]) as tick:
+                with self.assertLogs(controller.LOGGER, level="ERROR") as logs:
+                    # assertLogs replaces handlers; keep the real file output too.
+                    controller.LOGGER.addHandler(file_handler)
+                    code = controller.run_scheduler(
+                        root, "local", 0, False, True,
+                        {"pools": {"local-fake": _pool("local-fake")},
+                         "max_submits_per_tick": 1, "require_complete": False},
+                    )
+            self.assertEqual(code, 0)
+            self.assertEqual(tick.call_count, 2)
+            output = "\n".join(logs.output)
+            self.assertIn("tick failed; retrying in 0s", output)
+            self.assertIn("RuntimeError: boom", output)
+            log_text = (root / "scheduler" / "log" / "scheduler.log").read_text(encoding="utf-8")
+            self.assertIn("tick failed; retrying in 0s", log_text)
+            self.assertIn("Traceback (most recent call last):", log_text)
+            self.assertIn("RuntimeError: boom", log_text)
+
+    def test_run_scheduler_once_reraises_tick_exception(self) -> None:
+        error = RuntimeError("boom")
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(controller, "tick", side_effect=error) as tick:
+                with self.assertRaises(RuntimeError) as raised:
+                    controller.run_scheduler(
+                        Path(directory), "local", 0, True, True,
+                        {"pools": {"local-fake": _pool("local-fake")},
+                         "max_submits_per_tick": 1, "require_complete": False},
+                    )
+            self.assertIs(raised.exception, error)
+            self.assertEqual(tick.call_count, 1)
 
 
 if __name__ == "__main__":

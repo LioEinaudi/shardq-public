@@ -73,6 +73,13 @@ failure's `retry_after_unix` selects `PENDING_BACKOFF` or `PENDING`.
 `lease/` is acquired with atomic `os.mkdir`. Heartbeats contain Unix seconds
 and do not depend on filesystem mtime.
 
+`read_json` returns its default for ledger files deleted during a read or
+containing incomplete content; the next tick re-derives state so transient
+scan results recover. An exception from an individual scheduler tick is logged
+with its traceback to `<root>/scheduler/log/scheduler.log`, then the loop
+waits for the poll interval and retries. Only `--once` propagates the exception
+to the CLI.
+
 Existing ledgers use this same schema. Old `pool_snapshot` objects with
 top-level `column` and `lmms_root` are normalized when a worker must recover
 configuration from a snapshot.

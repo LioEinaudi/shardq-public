@@ -103,10 +103,18 @@ def atomic_write_json(path: Path, payload: Any) -> None:
 
 
 def read_json(path: Path, default: Any = None) -> Any:
-    if not path.is_file():
+    """Read a ledger file that another process may atomically replace or delete.
+
+    Missing or incomplete content returns default: the file is absent or
+    unavailable at this instant, and the next scan will re-derive state.
+    """
+    try:
+        if not path.is_file():
+            return default
+        with path.open(encoding="utf-8") as handle:
+            return json.load(handle)
+    except (FileNotFoundError, NotADirectoryError, ValueError):
         return default
-    with path.open(encoding="utf-8") as handle:
-        return json.load(handle)
 
 
 def _attempt_failures(shard_dir: Path) -> List[dict]:

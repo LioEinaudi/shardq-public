@@ -497,7 +497,14 @@ def run_scheduler(
         if isinstance(previous, dict):
             opts.setdefault("_pool_backoff", dict(previous.get("pool_backoff") or {}))
         while True:
-            state = tick(root, launcher_name, pools, opts, time.time())
+            try:
+                state = tick(root, launcher_name, pools, opts, time.time())
+            except Exception:
+                if once:
+                    raise
+                LOGGER.exception("tick failed; retrying in %ds", poll_seconds)
+                time.sleep(poll_seconds)
+                continue
             LOGGER.info(
                 "tick actions=%d warnings=%d workers_polled=%d cut=%d submitted=%d merges=%d seconds=%.1f",
                 len(state["actions"]),
