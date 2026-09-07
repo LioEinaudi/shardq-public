@@ -60,10 +60,11 @@ unix time, not the file mtime. Records in an attempt are only trusted after
 ## Triage recipes
 
 Ticks are slow
-: the log line carries `workers_polled` and `seconds`. Polling cost is one launcher call per
-live worker; the loop is tick time plus `--poll-seconds`, so a short poll only helps once
-the tick itself is short. Submits are the other cost: lower `--max-submits-per-tick` if
-one tick must stay under the poll interval.
+: the log line carries `workers_polled`, `cut`, `submitted`, and `seconds`. Polling cost
+is one launcher call per live worker; the loop is tick time plus `--poll-seconds`, so a
+short poll only helps once the tick itself is short. Submissions already run in parallel
+with 4 threads: for n submissions in one pool and about 3 s per launcher call, submission
+cost per tick is approximately `ceil(n / 4) * 3 s`.
 
 A partition stays `cut` after all shards are done
 : a merge is in flight (`merges_in_flight` in `state.json`, log line `merges=N`). The

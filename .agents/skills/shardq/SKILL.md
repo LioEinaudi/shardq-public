@@ -26,10 +26,17 @@ description: Use when asked to run, monitor, debug, or extend ShardQ, the filesy
 - Caps are per pool and shared by every job registered on that pool. Nothing limits how
   many jobs may be registered at once.
 - Each tick submits `min(demand - live, pool.max_workers - live, --max-submits-per-tick)`
-  workers, where live counts queued plus running workers and demand is pending shards
-  plus estimated uncut shards. Volc probe mode additionally keeps at most
+  workers, where live counts queued plus running workers and demand is pending,
+  backoff and leased shards; uncut units are never counted, so a worker is only
+  submitted when a shard already exists for it. Volc probe mode additionally keeps at most
   `volc.max_queued` workers waiting in the queue; running workers no longer count. So
   `max_workers` is the GPU ceiling and `max_queued` only bounds unstarted tasks.
+- Each tick cuts at most `min(lookahead - pending - backoff, --max-cuts-per-tick)`
+  shards per partition while below lookahead, subject to remaining units and
+  `shard.limit_units`. `--max-cuts-per-tick` defaults to 64, so `lookahead` also
+  determines how fast the pool can scale up. Jobs with one-unit shards
+  (`min_units = max_units = 1`) should set `lookahead` at least as high as the desired
+  worker count.
 - Which job a worker serves is decided at claim time, in this order: same partition as
   its last shard, same `session_key` (model already loaded), higher job `priority`, fewer
   remaining shards, shards without prior failures, lower start unit. A worker with a

@@ -16,6 +16,7 @@ import shardq
 
 from .cutter import plan_cut, update_history
 from .launchers import get_launcher
+from .launchers.base import TransientSubmitError
 from .ledger import Ledger, ShardState, atomic_write_json, read_json
 from .merge import merge_partition
 from .spec import PoolSpec, load_pools, resolve_pools_path, slug
@@ -25,6 +26,7 @@ LOGGER = logging.getLogger("shardq.controller")
 _LAUNCHERS = {}
 _LOG_ROOT = None
 STATUS_THREADS = 8
+SUBMIT_THREADS = 4
 MERGE_THREADS = 2
 MERGE_RETRY_SECONDS = 600
 
@@ -260,18 +262,26 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
     jobs = [ledger.scan_job(job_id, now) for job_id in job_ids]
     _update_history(root, jobs, now, actions)
 
+    max_cuts = int(opts.get("max_cuts_per_tick", 64))
     for job_id in job_ids:
         job = ledger.scan_job(job_id, now)
         if job.stopped:
             continue
         shard_cfg = job.spec.get("shard") or {}
+        lookahead = int(shard_cfg.get("lookahead", 4))
         for partition in job.partitions.values():
-            if partition.next_cut >= partition.size or partition.pending + partition.backoff >= int(shard_cfg.get("lookahead", 4)):
-                continue
-            count = plan_cut(partition.size, partition.next_cut, partition.unit_seconds_est, shard_cfg)
-            if count:
+            next_cut = partition.next_cut
+            ahead = partition.pending + partition.backoff
+            cuts = 0
+            while next_cut < partition.size and ahead < lookahead and cuts < max_cuts:
+                count = plan_cut(partition.size, next_cut, partition.unit_seconds_est, shard_cfg)
+                if not count:
+                    break
                 shard_id = ledger.cut(job_id, partition.name, count, count * partition.unit_seconds_est, now)
                 actions.append({"action": "cut", "job_id": job_id, "partition": partition.name, "shard_id": shard_id, "count": count})
+                next_cut += count
+                ahead += 1
+                cuts += 1
 
     # Merges run in background threads so a slow aggregation never stalls the tick.
     merges = opts.setdefault("_merges", {})
@@ -325,16 +335,13 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
         if float(backoff.get(pool_name, 0)) > now:
             continue
         pool_jobs = [job for job in current_jobs if job.pool == pool_name and not job.stopped]
-        claimable = 0
-        uncut_shards = 0
+        pending = 0
+        leased = 0
         for job in pool_jobs:
-            shard_cfg = job.spec.get("shard") or {}
             for partition in job.partitions.values():
-                claimable += partition.pending
-                remaining = max(0, partition.size - partition.next_cut)
-                estimated_units = max(1, plan_cut(partition.size, partition.next_cut, partition.unit_seconds_est, shard_cfg)) if remaining else 1
-                uncut_shards += int(math.ceil(float(remaining) / estimated_units)) if remaining else 0
-        demand = claimable + uncut_shards
+                pending += partition.pending + partition.backoff
+                leased += partition.leased
+        demand = pending + leased
         pool_workers = [row for row in workers.values() if row.get("pool") == pool_name]
         non_dead = [row for row in pool_workers if not str(row.get("last_status", "")).startswith("terminal:")]
         queued = sum(row.get("last_status") == "queued" for row in non_dead)
@@ -350,6 +357,7 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
             to_submit = (
                 0 if queued >= max_queued else min(to_submit, max_queued - queued)
             )
+        submissions = []
         for index in range(to_submit):
             worker_id = f"shardq-{slug(pool_name)}-{int(now * 1000)}-{index}"
             pools_path = str(opts.get("_pools_path") or "")
@@ -372,27 +380,46 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
             ]
             if pools_path:
                 worker_argv.extend(["--pools", pools_path])
+            submissions.append((worker_id, worker_argv, env))
+
+        def submit(item):
+            worker_id, worker_argv, env = item
             try:
                 handle = launcher.submit(worker_id, worker_argv, env)
-                row = {
-                    "worker_id": worker_id,
-                    "pool": pool_name,
-                    "launcher": launcher_name,
-                    "handle": handle,
-                    "submitted_unix": now,
-                    "last_status": "queued" if launcher_name == "volc" else "running",
-                    "last_checked_unix": now,
-                    "dead": False,
-                    "gpu_slots": gpu_slots,
-                }
-                atomic_write_json(root / "workers" / f"{worker_id}.json", row)
-                workers[handle] = row
-                actions.append({"action": "submit", "pool": pool_name, "worker_id": worker_id, "handle": handle})
+                return worker_id, handle, None
             except Exception as exc:
-                backoff[pool_name] = now + 300
-                warnings.append(f"{pool_name}: submit failed: {type(exc).__name__}: {exc}")
-                LOGGER.exception("worker submission failed for pool %s", pool_name)
-                break
+                if isinstance(exc, TransientSubmitError):
+                    LOGGER.warning("worker submission throttled for pool %s: %s", pool_name, exc)
+                else:
+                    LOGGER.exception("worker submission failed for pool %s", pool_name)
+                return worker_id, None, exc
+
+        if submissions:
+            with ThreadPoolExecutor(
+                max_workers=min(SUBMIT_THREADS, to_submit), thread_name_prefix="shardq-submit"
+            ) as executor:
+                for worker_id, handle, exc in executor.map(submit, submissions):
+                    if exc is not None:
+                        if isinstance(exc, TransientSubmitError):
+                            warnings.append(f"{pool_name}: submit throttled: {exc}")
+                        else:
+                            backoff[pool_name] = now + 300
+                            warnings.append(f"{pool_name}: submit failed: {type(exc).__name__}: {exc}")
+                        continue
+                    row = {
+                        "worker_id": worker_id,
+                        "pool": pool_name,
+                        "launcher": launcher_name,
+                        "handle": handle,
+                        "submitted_unix": now,
+                        "last_status": "queued" if launcher_name == "volc" else "running",
+                        "last_checked_unix": now,
+                        "dead": False,
+                        "gpu_slots": gpu_slots,
+                    }
+                    atomic_write_json(root / "workers" / f"{worker_id}.json", row)
+                    workers[handle] = row
+                    actions.append({"action": "submit", "pool": pool_name, "worker_id": worker_id, "handle": handle})
 
     final_jobs = [ledger.scan_job(job_id, now) for job_id in job_ids]
     state = {
@@ -405,6 +432,8 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
         "warnings": warnings,
         "pool_backoff": dict(backoff),
         "workers_polled": workers_polled,
+        "shards_cut": sum(action["action"] == "cut" for action in actions),
+        "workers_submitted": sum(action["action"] == "submit" for action in actions),
         "tick_seconds": round(time.time() - tick_started, 3),
         "merges_in_flight": [
             {"job_id": key[0], "partition": key[1], "started_unix": entry["started_unix"]}
@@ -470,10 +499,12 @@ def run_scheduler(
         while True:
             state = tick(root, launcher_name, pools, opts, time.time())
             LOGGER.info(
-                "tick actions=%d warnings=%d workers_polled=%d merges=%d seconds=%.1f",
+                "tick actions=%d warnings=%d workers_polled=%d cut=%d submitted=%d merges=%d seconds=%.1f",
                 len(state["actions"]),
                 len(state["warnings"]),
                 int(state.get("workers_polled", 0)),
+                int(state.get("shards_cut", 0)),
+                int(state.get("workers_submitted", 0)),
                 len(state.get("merges_in_flight", [])),
                 float(state.get("tick_seconds", 0.0)),
             )

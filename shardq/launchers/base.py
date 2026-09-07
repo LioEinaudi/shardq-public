@@ -7,6 +7,10 @@ from typing import Dict, List, Optional
 from ..spec import PoolSpec
 
 
+class TransientSubmitError(RuntimeError):
+    """Submission was rejected before any task was created; safe to retry."""
+
+
 class Launcher(ABC):
     name = ""
 

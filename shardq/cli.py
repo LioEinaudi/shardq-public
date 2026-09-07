@@ -363,6 +363,7 @@ def build_parser() -> argparse.ArgumentParser:
     scheduler.add_argument("--once", action="store_true")
     scheduler.add_argument("--exit-when-idle", action="store_true")
     scheduler.add_argument("--max-submits-per-tick", type=int, default=4)
+    scheduler.add_argument("--max-cuts-per-tick", type=int, default=64)
     scheduler.add_argument("--require-complete", action="store_true")
 
     worker = commands.add_parser("worker")
@@ -443,9 +444,13 @@ def main(argv: List[str] = None) -> int:
             return 0
 
         if args.command == "scheduler":
-            if args.poll_seconds <= 0 or args.max_submits_per_tick <= 0:
+            if (
+                args.poll_seconds <= 0
+                or args.max_submits_per_tick <= 0
+                or args.max_cuts_per_tick <= 0
+            ):
                 raise ValueError(
-                    "poll-seconds and max-submits-per-tick must be positive"
+                    "poll-seconds, max-submits-per-tick and max-cuts-per-tick must be positive"
                 )
             root = _root(args.root)
             pools_path = resolve_pools_path(args.pools, root)
@@ -457,6 +462,7 @@ def main(argv: List[str] = None) -> int:
                 args.exit_when_idle,
                 {
                     "max_submits_per_tick": args.max_submits_per_tick,
+                    "max_cuts_per_tick": args.max_cuts_per_tick,
                     "require_complete": args.require_complete,
                     "pools": load_pools(pools_path),
                     "pools_path": pools_path,

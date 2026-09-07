@@ -25,7 +25,7 @@ then `$SHARDQ_POOLS`, then `<root>/pools.json`, else error. Any `ValueError`,
   backend hint. `--dry-run` prints the payload and writes nothing.
 - Prints the job payload as JSON on success.
 
-## scheduler [--launcher volc|local] [--poll-seconds 60] [--once] [--exit-when-idle] [--max-submits-per-tick 4] [--require-complete]
+## scheduler [--launcher volc|local] [--poll-seconds 60] [--once] [--exit-when-idle] [--max-submits-per-tick 4] [--max-cuts-per-tick 64] [--require-complete]
 
 - Holds a non-blocking `flock` on `<root>/scheduler/lock`; exits 3 if another scheduler
   holds it.
@@ -33,22 +33,32 @@ then `$SHARDQ_POOLS`, then `<root>/pools.json`, else error. Any `ValueError`,
 - One tick, in order: refresh worker statuses through the launcher (workers already in a
   `terminal:*` state are not polled again; live ones are polled with 8 threads); expire leases;
   bisect or quarantine shards over `max_errors` or `max_preemptions`; update the runtime
-  EMA in `history.json`; cut new shards while pending plus backoff shards are below
-  `shard.lookahead`; start a background merge (2 threads) for partitions whose shards
+  EMA in `history.json`; cut shards until pending plus backoff reaches `shard.lookahead`
+  (at most `--max-cuts-per-tick` per partition per tick); start a background merge
+  (2 threads) for partitions whose shards
   are all done, superseded, or quarantined, and collect finished ones; submit workers.
   A merge never blocks the tick; a failed merge is retried after 600 s and listed in
   `warnings`. `state.json` lists `merges_in_flight`.
 - Submission count per pool is `min(demand - live, pool.max_workers - live,
-  --max-submits-per-tick)`, where demand is pending shards plus estimated uncut shards.
+  --max-submits-per-tick)`, where demand = pending + backoff + leased shards and live
+  counts queued plus running workers. Uncut units are never counted. Submissions run
+  concurrently with up to 4 threads, with successful workers recorded in submission order.
   Volc `capacity_mode: probe` additionally caps queued workers at `volc.max_queued`;
   `audit` divides `capacity_slots()` by `volc.gpu_slots`.
-- A failed submit puts the pool on a 300 s backoff, persisted in `state.json`.
+- A failed submit puts the pool on a 300 s backoff, persisted in `state.json`; other
+  successful submissions in the same batch are still recorded.
+  Volc flow-control rejections are retried up to 5 times inside the launcher with a
+  1 to 3 s jittered wait per attempt; if they still fail they are logged as
+  `submit throttled` and do not trigger the backoff. There are 5 attempts total,
+  and the jittered wait is multiplied by the attempt number.
 - `--once` runs one tick and exits 0. `--exit-when-idle` exits 0 once every partition is
   merged or partial and no non-terminal worker remains.
 - `--require-complete` refuses to merge a partition with quarantined units and logs a
   warning instead of writing a partial marker.
 - Writes `scheduler/state.json`, `scheduler/status.md`, and
-  `scheduler/log/scheduler.log`.
+  `scheduler/log/scheduler.log`. Tick log fields are `actions`, `warnings`,
+  `workers_polled`, `cut`, `submitted`, `merges`, and `seconds`; `state.json` also
+  records this tick's `shards_cut` and `workers_submitted` counts.
 
 ## worker --pool POOL [--worker-id ID] [--max-wall-seconds N] [--idle-exit-seconds N] [--job JOB ...]
 

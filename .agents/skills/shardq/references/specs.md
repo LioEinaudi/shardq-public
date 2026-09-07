@@ -21,7 +21,11 @@ Both files are JSON objects. Validation lives in `shardq/spec.py`; the examples 
 `limit_units` null, `lookahead` 4. The cutter sizes each shard to about
 `target_seconds / unit_seconds_est`, clamped to `[min_units, max_units]`.
 `limit_units` truncates every partition (smoke runs). `lookahead` is how many pending
-plus backoff shards may exist per partition before cutting pauses.
+plus backoff shards may exist per partition before cutting pauses. It is also the
+maximum number of shards cut per partition per tick, further bounded by
+`--max-cuts-per-tick` (default 64), existing pending/backoff shards, and remaining units.
+For one-unit shards (`min_units = max_units = 1`), set `lookahead` at least as high as
+the desired worker count so cutting can supply enough shards for scale-up.
 
 `retry` defaults: `max_errors` 3, `max_preemptions` 20, `backoff_seconds` 300,
 `bisect` true, `lease_ttl_seconds` 900. Exceeding either limit bisects the shard while

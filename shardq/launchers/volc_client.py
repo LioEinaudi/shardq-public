@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+import random
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
+from .base import TransientSubmitError
 
+
+FLOW_CONTROL_MARKER = "beyond the current flow control limit"
+SUBMIT_RETRIES = 5
 TERMINAL = {
     "Success",
     "Failed",
@@ -88,10 +94,19 @@ def _parse_submit_task_id(output: str) -> str:
 
 
 def submit(conf_path: Path) -> str:
-    output = _run_output(
-        ["submit", "--conf", str(Path(conf_path)), "-o", "json"]
-    )
-    return _parse_submit_task_id(output)
+    for attempt in range(1, SUBMIT_RETRIES + 1):
+        try:
+            output = _run_output(
+                ["submit", "--conf", str(Path(conf_path)), "-o", "json"]
+            )
+        except RuntimeError as exc:
+            if FLOW_CONTROL_MARKER not in str(exc):
+                raise
+            if attempt == SUBMIT_RETRIES:
+                raise TransientSubmitError(str(exc)) from exc
+            time.sleep(random.uniform(1.0, 3.0) * attempt)
+        else:
+            return _parse_submit_task_id(output)
 
 
 def get_task(task_id: str) -> dict:
