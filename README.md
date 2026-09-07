@@ -63,7 +63,7 @@ workers. In `audit` mode, also set `creator` and `gpu_cap`; ShardQ sums
 non-terminal requested GPU slots before submitting.
 
 The [Volc deployment template](examples/deployments/volc-lmms/) includes
-a configurable pool, six example job specs and their protocol descriptions.
+a configurable pool, six example job specs and a batch scheduler script.
 
 ## Optional lmms backend
 

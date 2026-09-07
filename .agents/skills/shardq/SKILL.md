@@ -69,6 +69,9 @@ shardq selftest-fs --root "$SHARDQ_ROOT/_selftest"   # once per new filesystem; 
 shardq register job.json --dry-run            # validates spec, prints pins, writes nothing
 shardq register job.json                      # lmms backend: add --pin-mode verify to use the tree in place
 tmux new -d -s shardq "shardq scheduler --launcher volc"   # one scheduler per root; local: --launcher local
+tmux set-option -t shardq remain-on-exit on
+# Otherwise the window closes with the process, hiding startup failures or why it was killed.
+# In production, also tee stderr to <root>/scheduler/log/stderr.log.
 shardq status                                 # repeat; partitions end as merged or partial
 shardq publish --job <job_id> --out-dir /path/to/new/dir  # optional evidence bundle
 ```
@@ -129,7 +132,9 @@ Run `python -m unittest discover -s tests -v` afterwards.
 
 ## Hard rules
 
-- One scheduler per root. Run it under tmux; if it dies, restart it. Never run two.
+- One scheduler per root. Run it under tmux; if it dies, restart it. Preserve its
+  stderr (`remain-on-exit` or tee to a file), otherwise the exit reason is lost.
+  Never run two.
 - Never hand-edit or delete `lease/`, `attempts/`, `complete.json`, `failed.json`,
   `quarantine.json`, or `superseded.json`. Use `stop`, `split`, `merge`, or wait for lease
   expiry (`retry.lease_ttl_seconds`; twice that forces expiry regardless of the launcher).

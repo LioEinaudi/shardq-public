@@ -51,6 +51,14 @@ then `$SHARDQ_POOLS`, then `<root>/pools.json`, else error. Any `ValueError`,
   1 to 3 s jittered wait per attempt; if they still fail they are logged as
   `submit throttled` and do not trigger the backoff. There are 5 attempts total,
   and the jittered wait is multiplied by the attempt number.
+- If a tick raises an exception, the scheduler writes
+  `ERROR tick failed; retrying in <poll>s` and the full traceback to
+  `<root>/scheduler/log/scheduler.log`, sleeps for one poll interval, and continues
+  with the next tick without exiting. Only `--once` propagates the tick exception
+  to the CLI, which prints `error: ...` and exits 2 under the error rules above.
+  Logs go to both stderr and `scheduler.log`, but fatal errors outside this handler
+  (including startup failures and `KeyboardInterrupt`) appear only on stderr, so
+  preserve stderr when starting the scheduler.
 - `--once` runs one tick and exits 0. `--exit-when-idle` exits 0 once every partition is
   merged or partial and no non-terminal worker remains.
 - `--require-complete` refuses to merge a partition with quarantined units and logs a

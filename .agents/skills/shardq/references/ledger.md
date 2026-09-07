@@ -105,6 +105,16 @@ Scheduler will not start (exit 3)
 : `fuser <root>/scheduler/lock` or `tmux ls` to find the live scheduler. Kill the old
 one first; never run two against one root.
 
+state.json stale but scheduler.log still moving
+: run `grep "tick failed" <root>/scheduler/log/scheduler.log`; every failed tick has
+its traceback in that file. Consecutive failures indicate a persistent ledger or
+launcher problem; follow the traceback to fix it. No scheduler restart is needed.
+
+Scheduler process gone, log ends with a normal tick
+: the process may have been killed by a signal or, on versions without tick retries,
+crashed on transient ledger state. Check the last output in the tmux window or
+stderr file before restarting. The ledger needs no manual intervention.
+
 Merge failed
 : the scheduler retries after 600 s and logs the traceback in `scheduler.log`. For the
 lmms backend the usual cause is the merge interpreter (`pool.local_python`) missing the
