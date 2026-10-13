@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -38,6 +38,7 @@ class PoolSpec:
     worker_max_wall_seconds: int
     worker_idle_exit_seconds: int
     extra: dict
+    aihc: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -88,7 +89,7 @@ def pool_from_dict(name: str, row: dict) -> PoolSpec:
     if not isinstance(row, dict):
         raise ValueError(f"pool {name!r} must be an object")
     launcher = str(row.get("launcher", ""))
-    if launcher not in {"local", "volc"}:
+    if launcher not in {"local", "volc", "aihc"}:
         raise ValueError(f"pool {name!r}: invalid launcher {launcher!r}")
     extra = dict(row.get("extra") or {})
     # Old ledger snapshots stored these two backend-specific fields at top level.
@@ -108,6 +109,7 @@ def pool_from_dict(name: str, row: dict) -> PoolSpec:
         worker_max_wall_seconds=int(row.get("worker_max_wall_seconds", 14400)),
         worker_idle_exit_seconds=int(row.get("worker_idle_exit_seconds", 300)),
         extra=extra,
+        aihc=dict(row.get("aihc") or {}),
     )
     if not spec.backend:
         raise ValueError(f"pool {name!r}: backend is required")

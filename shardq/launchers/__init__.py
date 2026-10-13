@@ -14,4 +14,8 @@ def get_launcher(name: str) -> Type[Launcher]:
         from .volc import VolcLauncher
 
         return VolcLauncher
+    if name == "aihc":
+        from .aihc import AihcLauncher
+
+        return AihcLauncher
     raise ValueError(f"unknown shardq launcher: {name}")

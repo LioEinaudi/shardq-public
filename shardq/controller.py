@@ -42,6 +42,14 @@ def _launcher(root: Path, name: str, pool: PoolSpec):
     return _LAUNCHERS[key]
 
 
+def _launcher_block(pool: PoolSpec, launcher_name: str) -> dict:
+    if launcher_name == "volc":
+        return pool.volc
+    if launcher_name == "aihc":
+        return pool.aihc
+    return {}
+
+
 def _worker_files(root: Path) -> list:
     workers = root / "workers"
     if not workers.is_dir():
@@ -349,11 +357,12 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
         to_submit = max(0, min(demand - running, pool.max_workers - running, max_submits))
         launcher = _launcher(root, launcher_name, pool)
         slots = launcher.capacity_slots()
-        gpu_slots = int(pool.volc.get("gpu_slots", 1))
+        launcher_block = _launcher_block(pool, launcher_name)
+        gpu_slots = int(launcher_block.get("gpu_slots", 1))
         if slots is not None:
             to_submit = min(to_submit, int(slots) // max(1, gpu_slots))
-        elif launcher_name == "volc":
-            max_queued = int(pool.volc.get("max_queued", 0))
+        elif launcher_name in {"volc", "aihc"}:
+            max_queued = int(launcher_block.get("max_queued", 0))
             to_submit = (
                 0 if queued >= max_queued else min(to_submit, max_queued - queued)
             )
@@ -412,7 +421,11 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
                         "launcher": launcher_name,
                         "handle": handle,
                         "submitted_unix": now,
-                        "last_status": "queued" if launcher_name == "volc" else "running",
+                        "last_status": (
+                            "queued"
+                            if launcher_name in {"volc", "aihc"}
+                            else "running"
+                        ),
                         "last_checked_unix": now,
                         "dead": False,
                         "gpu_slots": gpu_slots,

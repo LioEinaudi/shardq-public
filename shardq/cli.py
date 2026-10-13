@@ -357,7 +357,7 @@ def build_parser() -> argparse.ArgumentParser:
     scheduler = commands.add_parser("scheduler")
     _add_config_args(scheduler)
     scheduler.add_argument(
-        "--launcher", choices=["volc", "local"], default="volc"
+        "--launcher", choices=["volc", "local", "aihc"], default="volc"
     )
     scheduler.add_argument("--poll-seconds", type=int, default=60)
     scheduler.add_argument("--once", action="store_true")

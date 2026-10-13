@@ -264,6 +264,35 @@ class CutAndSubmitTest(unittest.TestCase):
         self.assertEqual(state["workers_submitted"], 1)
 
 
+class AihcSubmitTest(unittest.TestCase):
+    def test_aihc_starts_queued_and_respects_max_queued(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            pool = _pool("local-fake")
+            pool.launcher = "aihc"
+            pool.aihc = {"gpu_slots": 1, "max_queued": 1}
+            pools = {pool.name: pool}
+            stub = _SubmitStubLauncher()
+            key = (str(root), "aihc", pool.name)
+            controller._LAUNCHERS[key] = stub
+            try:
+                register(
+                    root,
+                    PROJECT_ROOT / "examples" / "fake-demo.json",
+                    sizes={"p0": 40},
+                    pools=pools,
+                )
+                opts = {"max_submits_per_tick": 20}
+                first = controller.tick(root, "aihc", pools, opts, time.time())
+                self.assertEqual(first["workers_submitted"], 1)
+                self.assertEqual(first["workers"][0]["last_status"], "queued")
+                second = controller.tick(root, "aihc", pools, opts, time.time())
+                self.assertEqual(second["workers_submitted"], 0)
+                self.assertEqual(len(stub.calls), 1)
+            finally:
+                controller._LAUNCHERS.pop(key, None)
+
+
 class RunSchedulerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.old_handlers = controller.LOGGER.handlers[:]

@@ -21,6 +21,14 @@ from .spec import (
 )
 
 
+def _launcher_block(pool: PoolSpec) -> dict:
+    if pool.launcher == "volc":
+        return pool.volc
+    if pool.launcher == "aihc":
+        return pool.aihc
+    return {}
+
+
 def _git(root: Path, *arguments: str, optional: bool = False) -> Optional[str]:
     proc = subprocess.run(
         ["git", "-C", str(root), *arguments],
@@ -70,9 +78,12 @@ def register(
 
     backend_class = get_backend(spec.backend)
     pin_hook = backend_class.preview_pins if dry_run else backend_class.pins
+    launcher_block = _launcher_block(pool)
     pins = {
-        "image": pool.volc.get("image"),
-        "flavor": pool.volc.get("flavor"),
+        "image": launcher_block.get("image"),
+        "flavor": launcher_block.get(
+            "flavor", launcher_block.get("gpu_resource")
+        ),
     }
     pins.update(pin_hook(pool, root, spec.job_id, pin_mode))
     control_root = Path.cwd().resolve()

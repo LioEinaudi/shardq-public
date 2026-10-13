@@ -65,6 +65,9 @@ non-terminal requested GPU slots before submitting.
 The [Volc deployment template](examples/deployments/volc-lmms/) includes
 a configurable pool, six example job specs and a batch scheduler script.
 
+For AIHC GPU workers, set `aihc.gpu_resource` to the resource name advertised
+by your queue. CPU-only pools can set `aihc.gpu_slots` to zero.
+
 ## Optional lmms backend
 
 Registration records the lmms Git revision and proves that `lmms_eval`
