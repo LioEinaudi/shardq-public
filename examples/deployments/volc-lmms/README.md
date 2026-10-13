@@ -27,11 +27,11 @@ export SHARDQ_ROOT=/absolute/path/to/shared/ledger
 export SHARDQ_POOLS="$PWD/pools.json"
 shardq register jobs/videomme-smoke.json --pin-mode verify --dry-run
 shardq register jobs/videomme-smoke.json --pin-mode verify
-./start-scheduler.sh &
+./start-scheduler.sh
 shardq status --job example-videomme-smoke --json
 ```
 
 The smoke spec limits coverage to two videos. To run the full partition,
-register `jobs/videomme-full.json` while the scheduler is running. The example
+register `jobs/videomme-full.json` and start the scheduler again. The example
 pool allows up to two live workers. Scheduler logs are under
 `$SHARDQ_ROOT/scheduler/log/`.

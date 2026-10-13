@@ -308,6 +308,62 @@ class RunSchedulerTests(unittest.TestCase):
         controller.LOGGER.setLevel(self.old_level)
         controller._LOG_ROOT = self.old_log_root
 
+    def test_exit_when_idle_with_stopped_unfinished_job(self) -> None:
+        from shardq.cli import main
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pools = {"local-fake": _pool("local-fake")}
+            register(root, PROJECT_ROOT / "examples" / "fake-demo.json",
+                     sizes={"p0": 4}, pools=pools)
+            self.assertEqual(main(["stop", "--root", str(root), "--job", "fake-demo"]), 0)
+            with patch.object(controller.time, "sleep", side_effect=AssertionError(
+                "idle scheduler keeps polling a stopped job"
+            )):
+                self.assertEqual(controller.run_scheduler(
+                    root, "local", 1, False, True, {"pools": pools}
+                ), 0)
+            job = Ledger(root).scan_job("fake-demo", time.time())
+            self.assertTrue(job.stopped)
+            self.assertNotIn(job.partitions["p0"].status, {"merged", "partial"})
+
+    def test_exit_when_idle_waits_for_work_workers_leases_and_merges(self) -> None:
+        idle = {"jobs": [], "workers": [], "actions": [], "warnings": []}
+        stopped = {"stopped": True, "partitions": {"p0": {"status": "cut", "leased": 0}}}
+        active = {"stopped": False, "partitions": {"p0": {"status": "cut", "leased": 0}}}
+        cases = [
+            {"jobs": [stopped, active]},
+            {"jobs": [stopped], "merges_in_flight": [{"job_id": "stopped", "partition": "p0"}]},
+            {"jobs": [{"stopped": True, "partitions": {"p0": {"status": "cut", "leased": 1}}}]},
+        ]
+        cases.extend({"jobs": [stopped], "workers": [{"last_status": status}]}
+                     for status in ["queued", "running", "unknown"])
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                with patch.object(controller, "tick", side_effect=[dict(idle, **case), idle]) as tick:
+                    with patch.object(controller.time, "sleep") as sleep:
+                        code = controller.run_scheduler(
+                            Path(directory), "local", 1, False, True, {"pools": {}}
+                        )
+                self.assertEqual(code, 0)
+                self.assertEqual(tick.call_count, 2)
+                sleep.assert_called_once_with(1)
+
+    def test_exit_when_idle_accepts_merged_and_partial_with_stopped_jobs(self) -> None:
+        state = {
+            "jobs": [
+                {"stopped": False, "partitions": {"p0": {"status": "merged"}, "p1": {"status": "partial"}}},
+                {"stopped": True, "partitions": {"old": {"status": "cut"}}},
+            ],
+            "workers": [{"last_status": "terminal:Succeeded"}], "actions": [], "warnings": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(controller, "tick", return_value=state):
+                with patch.object(controller.time, "sleep", side_effect=AssertionError("idle loop")):
+                    self.assertEqual(controller.run_scheduler(
+                        Path(directory), "local", 1, False, True, {"pools": {}}
+                    ), 0)
+
     def test_run_scheduler_logs_and_continues_after_tick_exception(self) -> None:
         idle_state = {
             "jobs": [], "workers": [], "actions": [], "warnings": [], "merges_in_flight": [],

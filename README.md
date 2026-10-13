@@ -32,6 +32,21 @@ merge.
 
 ## Configuration
 
+For a batch run under tmux, register the jobs first, set `SHARDQ_ROOT` and
+`SHARDQ_POOLS`, then start the scheduler with automatic exit:
+
+```bash
+mkdir -p "$SHARDQ_ROOT/scheduler/log"
+tmux new -d -s shardq 'exec shardq scheduler --launcher volc --exit-when-idle >>"$SHARDQ_ROOT/scheduler/log/stdout.log" 2>>"$SHARDQ_ROOT/scheduler/log/stderr.log"' \; set-option -t shardq:0 remain-on-exit off
+```
+
+Use the launcher for your pool (`local`, `volc`, or `aihc`). The scheduler exits
+once unstopped jobs are merged or partial, workers and leases have drained, and
+background merges have finished. Stopped jobs remain unfinished; restart the
+scheduler after resuming them or registering new work. `remain-on-exit off`
+closes exited panes; inspect the saved stderr log for failures. Setting it to
+`on` retains every exited pane, including successful runs.
+
 The ledger root is resolved in this order:
 
 1. `--root`

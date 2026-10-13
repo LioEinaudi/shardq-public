@@ -1,6 +1,6 @@
 ---
 name: shardq
-description: Use when asked to run, monitor, debug, or extend ShardQ, the filesystem-ledger scheduler that cuts a long benchmark into short preemptible ranges for idle-queue GPUs (Volcengine idle queue or local processes). Covers registering job specs, running the scheduler in tmux, reading status and ledger files, handling preemptions, poison units and partial merges, publishing results, adapting any benchmark through the script backend, and adding a backend or launcher. Also triggers on 分片调度, 闲时资源跑 benchmark, or paths like <root>/jobs/<job>/partitions.
+description: Use when asked to run, monitor, debug, or extend ShardQ, the filesystem-ledger scheduler that cuts a long benchmark into short preemptible ranges for idle-queue GPUs (Volcengine idle queue or local processes). Covers registering job specs, running the scheduler in tmux, reading status and ledger files, handling preemptions, poison units and partial merges, publishing results, adapting any benchmark through the script backend, and adding a backend or launcher. Also triggers on 分片调度, 闲时资源跑 benchmark, or ledger paths under jobs/JOB/partitions.
 ---
 
 # ShardQ
@@ -68,10 +68,10 @@ export SHARDQ_POOLS=/path/to/pools.json       # see references/specs.md
 shardq selftest-fs --root "$SHARDQ_ROOT/_selftest"   # once per new filesystem; expect conflicts 0
 shardq register job.json --dry-run            # validates spec, prints pins, writes nothing
 shardq register job.json                      # lmms backend: add --pin-mode verify to use the tree in place
-tmux new -d -s shardq "shardq scheduler --launcher volc"   # one scheduler per root; local: --launcher local
-tmux set-option -t shardq remain-on-exit on
-# Otherwise the window closes with the process, hiding startup failures or why it was killed.
-# In production, also tee stderr to <root>/scheduler/log/stderr.log.
+mkdir -p "$SHARDQ_ROOT/scheduler/log"
+tmux new -d -s shardq 'exec shardq scheduler --launcher volc --exit-when-idle >>"$SHARDQ_ROOT/scheduler/log/stdout.log" 2>>"$SHARDQ_ROOT/scheduler/log/stderr.log"' \; set-option -t shardq:0 remain-on-exit off
+# One scheduler per root; local: --launcher local. Exits close the window; inspect
+# stdout.log and stderr.log for failures. Do not use remain-on-exit on for batch runs.
 shardq status                                 # repeat; partitions end as merged or partial
 shardq publish --job <job_id> --out-dir /path/to/new/dir  # optional evidence bundle
 ```
@@ -81,6 +81,10 @@ shardq publish --job <job_id> --out-dir /path/to/new/dir  # optional evidence bu
 - Merged outputs: `<root>/jobs/<job>/merged/<partition>/{results.json,records.jsonl,merge.json}`
   and markers under `<root>/jobs/<job>/markers/<column>/`.
 - `job_id` is permanent. `register` refuses an existing id; to rerun, pick a new id.
+- `--exit-when-idle` exits after all unstopped jobs merge (complete or partial),
+  workers and leases drain, and background merges finish. Stopped jobs remain stopped
+  and unfinished; resuming or registering more work after exit requires restarting
+  the scheduler. Omit this flag only for an intentionally persistent scheduler.
 
 ### B. Monitor and triage
 
@@ -91,6 +95,10 @@ Order of checks when something looks stuck:
    If `updated_unix` stops moving but `scheduler.log` keeps updating, run
    `grep "tick failed" <root>/scheduler/log/scheduler.log`; tick exceptions are
    logged there with tracebacks and the loop keeps retrying.
+   A visible tmux session may contain only a dead pane: check `tmux list-panes -a -F
+   '#{session_name} #{pane_id} #{pane_dead} #{pane_dead_status} #{remain-on-exit}'`.
+   Before removing a dead pane, capture its output and verify it is still dead;
+   use its pane ID to avoid closing other windows. Check custom `tmux -S` sockets too.
 2. `warnings` and `pool_backoff` in `state.json`: a failed submit backs a pool off 300 s.
 3. Workers table in `shardq status`: `queued` on Volc means waiting for idle GPUs. `terminal:*` rows are normal
    after preemption or wall clock; the scheduler resubmits while demand exists.
@@ -132,8 +140,9 @@ Run `python -m unittest discover -s tests -v` afterwards.
 
 ## Hard rules
 
-- One scheduler per root. Run it under tmux; if it dies, restart it. Preserve its
-  stderr (`remain-on-exit` or tee to a file), otherwise the exit reason is lost.
+- One scheduler per root. Run it under tmux; if it fails, inspect and restart it.
+  Normal `--exit-when-idle` completion does not need a restart until more work arrives.
+  Preserve stdout/stderr to files and use `remain-on-exit off` for batch runs.
   Never run two.
 - Never hand-edit or delete `lease/`, `attempts/`, `complete.json`, `failed.json`,
   `quarantine.json`, or `superseded.json`. Use `stop`, `split`, `merge`, or wait for lease

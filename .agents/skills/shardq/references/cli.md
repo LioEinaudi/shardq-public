@@ -59,8 +59,12 @@ then `$SHARDQ_POOLS`, then `<root>/pools.json`, else error. Any `ValueError`,
   Logs go to both stderr and `scheduler.log`, but fatal errors outside this handler
   (including startup failures and `KeyboardInterrupt`) appear only on stderr, so
   preserve stderr when starting the scheduler.
-- `--once` runs one tick and exits 0. `--exit-when-idle` exits 0 once every partition is
-  merged or partial and no non-terminal worker remains.
+- `--once` runs one tick and exits 0. `--exit-when-idle` exits 0 once every partition of
+  unstopped jobs is merged or partial, no non-terminal worker or lease remains, and
+  background merges have finished. Stopped jobs are left unfinished and require a
+  scheduler restart when resumed after exit. Without this flag the scheduler keeps polling.
+  Under tmux, persist stdout/stderr to files and use `remain-on-exit off` so
+  exits close the window; `remain-on-exit on` retains even successfully completed panes.
 - `--require-complete` refuses to merge a partition with quarantined units and logs a
   warning instead of writing a partial marker.
 - Writes `scheduler/state.json`, `scheduler/status.md`, and

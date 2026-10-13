@@ -531,15 +531,24 @@ def run_scheduler(
             if once:
                 return 0
             if exit_when_idle:
+                # Stopped jobs cannot make progress until explicitly resumed.
+                # Their unfinished partitions must not keep a batch scheduler alive.
                 complete = all(
                     partition["status"] in {"merged", "partial"}
                     for job in state["jobs"]
+                    if not job.get("stopped", False)
                     for partition in job["partitions"].values()
                 )
                 alive = any(
                     not str(worker.get("last_status", "")).startswith("terminal:")
                     for worker in state["workers"]
                 )
-                if complete and not alive:
+                leased = any(
+                    partition.get("leased", 0) > 0
+                    for job in state["jobs"]
+                    for partition in job["partitions"].values()
+                )
+                if complete and not alive and not leased and not state.get("merges_in_flight"):
+                    LOGGER.info("idle: active jobs finished, workers and merges drained; exiting")
                     return 0
             time.sleep(poll_seconds)

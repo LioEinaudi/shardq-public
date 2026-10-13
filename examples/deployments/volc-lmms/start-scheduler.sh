@@ -5,5 +5,5 @@ set -euo pipefail
 : "${SHARDQ_POOLS:?set SHARDQ_POOLS to the configured pools.json}"
 
 mkdir -p "$SHARDQ_ROOT/scheduler/log"
-exec shardq scheduler --launcher volc --poll-seconds 15 \
+exec shardq scheduler --launcher volc --poll-seconds 15 --exit-when-idle \
   >>"$SHARDQ_ROOT/scheduler/log/stdout.log" 2>>"$SHARDQ_ROOT/scheduler/log/stderr.log"
