@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import shlex
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -11,6 +12,12 @@ from .base import Launcher
 
 class AihcLauncher(Launcher):
     name = "aihc"
+
+    def submission_inputs(self) -> dict:
+        path = self.pool.aihc.get("aihc_config")
+        if not path:
+            return {}
+        return {"config_sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
 
     def _entrypoint(self, env: Dict[str, str]) -> str:
         combined = {str(key): str(value) for key, value in self.pool.env.items()}
