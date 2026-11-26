@@ -28,21 +28,23 @@ GPU_PER_REPLICA = {
     "ml.pni3ln.45xlarge": 8,
 }
 _TASK_ID_PATTERN = re.compile(r"task_id=(t-[A-Za-z0-9-]+)")
+_TEXT_RECEIPT = re.compile(r"^(?:submitted )?task_id=(t-[A-Za-z0-9-]+)[ \t]*$", re.M)
+_ARRAY_START = re.compile(r"^[ \t]*\[\s*(?=[{\]])", re.M)
+_DOCUMENT_START = re.compile(r'^[ \t]*(?:\[\s*(?=[{\]])|\{\s*(?="))', re.M)
+
+
+def _unique_fields(pairs):
+    fields = dict(pairs)
+    if len(fields) != len(pairs):
+        raise ValueError("duplicate fields in Volc JSON response")
+    return fields
 
 
 def parse_volc_json(output: str) -> List[Dict[str, Any]]:
-    for index, character in enumerate(output):
-        if character != "[":
-            continue
-        try:
-            payload = json.loads(output[index:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, list):
-            return payload
-    raise ValueError(
-        f"Volc output did not contain a JSON array: {output[-1000:]}"
-    )
+    start = _ARRAY_START.search(output)
+    if not start:
+        raise ValueError(f"Volc output did not contain a JSON array: {output[-1000:]}")
+    return json.loads(output[start.start():], object_pairs_hook=_unique_fields)
 
 
 def _run_output(arguments: List[str], timeout: int = 120) -> str:
@@ -66,12 +68,12 @@ def run_volc(
 
 
 def _parse_submit_task_id(output: str) -> str:
-    ids = set(_TASK_ID_PATTERN.findall(output))
+    ids = set(_TEXT_RECEIPT.findall(output))
     # The CLI can prefix its JSON with log messages. Once the document starts,
     # parse it as one receipt: skipping to a later object can hide a conflict.
-    start = re.search(r'\[\s*(?=[{\]])|\{\s*(?=")', output)
+    start = _DOCUMENT_START.search(output)
     if start:
-        payload = json.loads(output[start.start():])
+        payload = json.loads(output[start.start():], object_pairs_hook=_unique_fields)
         candidates = payload if isinstance(payload, list) else [payload]
         for candidate in candidates:
             if not isinstance(candidate, dict) or not candidate.keys() & {"Id", "JobId", "task_id"}:
@@ -82,7 +84,7 @@ def _parse_submit_task_id(output: str) -> str:
                     if not isinstance(value, str) or not re.fullmatch(r"t-[A-Za-z0-9-]+", value):
                         raise ValueError(f"invalid task id in submission output: {output[-1000:]}")
                     ids.add(value)
-    if len(ids) != 1:
+    if len(ids) != 1 or set(_TASK_ID_PATTERN.findall(output)) - ids:
         raise ValueError(f"expected one task id in submission output: {output[-1000:]}")
     return ids.pop()
 
@@ -110,7 +112,12 @@ def get_task(task_id: str) -> dict:
         raise RuntimeError(
             f"expected one Volc task for {task_id}, got {len(rows)}"
         )
-    return rows[0]
+    row = rows[0]
+    if not isinstance(row, dict) or any(
+        row[key] != task_id for key in ("Id", "JobId", "task_id") if key in row
+    ):
+        raise ValueError(f"Volc task identity does not match {task_id}")
+    return row
 
 
 def list_tasks(queue: str, creator: str) -> List[dict]:

@@ -26,7 +26,7 @@ CREATE_REJECTIONS = {"server rejected request: rate limit 429", "aihc quota exce
 SUBMIT_RETRIES = 5
 _JOB_ID_PATTERN = re.compile(r"\bjob-[a-z0-9]+\b")
 _CREATE_RECEIPT = re.compile(r"^(?:(?:successfully )?created (?:job:?[ ]+)?)?(job-[a-z0-9]+)[.]?$", re.M)
-_STATUS_PATTERN = re.compile(r"(?m)^    status: (\S+)\s*$")
+_JOB_DETAILS = re.compile(r"^openapigetjobresponseresult:[ \t]*\n((?:[ \t][^\n]*(?:\n|$)|\n)*)", re.M)
 
 
 def _run_output(
@@ -113,10 +113,16 @@ def get_job_status(
         binary=binary,
         config_file=config_file,
     )
-    match = _STATUS_PATTERN.search(output)
-    if not match:
-        raise RuntimeError("cannot parse status")
-    return match.group(1)
+    blocks = _JOB_DETAILS.findall(output)
+    if len(blocks) != 1:
+        raise RuntimeError("expected one AIHC job details block")
+    ids = re.findall(r"^    jobid:[ \t]*(.*)$", blocks[0], re.M)
+    if ids and [value.strip() for value in ids] != [job_id]:
+        raise RuntimeError(f"AIHC job identity does not match {job_id}")
+    statuses = re.findall(r"^    status:[ \t]*(.*)$", blocks[0], re.M)
+    if len(statuses) != 1 or not re.fullmatch(r"\S+", statuses[0].strip()):
+        raise RuntimeError("cannot parse a unique AIHC job status")
+    return statuses[0].strip()
 
 
 def stop_job(

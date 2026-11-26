@@ -45,6 +45,46 @@ class CloudRecoveryTests(unittest.TestCase):
                     volc_client.submit(Path("worker.yaml"))
                 self.assertEqual(invoke.call_count, 1)
 
+    def test_volc_requires_a_positive_unambiguous_create_receipt(self):
+        for reply in (
+            "warning: cached task_id=t-old; new acknowledgement missing",
+            'cached receipt: {"JobId":"t-old"}',
+            "cached task_id=t-old\nsubmitted task_id=t-new",
+            '{"JobId":"t-old","JobId":"t-new"}',
+        ):
+            with self.subTest(reply=reply), patch.object(volc_client, "_run_output", return_value=reply) as run:
+                with self.assertRaises(ValueError):
+                    volc_client.submit(Path("worker.yaml"))
+                run.assert_called_once()
+        for reply in ('log\nsubmitted task_id=t-new', 'log\n[{"JobId":"t-new"}]'):
+            with self.subTest(reply=reply), patch.object(volc_client, "_run_output", return_value=reply):
+                self.assertEqual(volc_client.submit(Path("worker.yaml")), "t-new")
+
+    def test_volc_get_rejects_foreign_or_ambiguous_terminal_status(self):
+        for reply in (
+            '[{"JobId":"t-old","Status":"Success"}]',
+            '[{"Id":"t-old","JobId":"t-new","Status":"Success"}]',
+            '[{"JobId":"t-new","Status":"Running","Status":"Success"}]',
+            '[{"JobId":"t-new","Status":"Running"}]\n[{"JobId":"t-new","Status":"Success"}]',
+        ):
+            with self.subTest(reply=reply), patch.object(volc_client, "_run_output", return_value=reply):
+                with self.assertRaises(ValueError):
+                    volc_client.get_task("t-new")
+        reply = '[info] task details\n[{"JobId":"t-new","Status":"Success"}]'
+        with patch.object(volc_client, "_run_output", return_value=reply):
+            self.assertEqual(volc_client.get_task("t-new")["Status"], "Success")
+
+    def test_aihc_get_rejects_foreign_or_ambiguous_terminal_status(self):
+        for reply in (
+            "openapigetjobresponseresult:\n    jobid: job-old\n    status: Succeeded",
+            "openapigetjobresponseresult:\n    jobid: job-new\n    status: Succeeded\n    status: Running",
+            "openapigetjobresponseresult:\n    jobid: job-new\npodlist:\n    status: Succeeded",
+            "openapigetjobresponseresult:\n    status: Succeeded\nopenapigetjobresponseresult:\n    status: Running",
+        ):
+            with self.subTest(reply=reply), patch.object(aihc_client, "_run_output", return_value=reply):
+                with self.assertRaises(RuntimeError):
+                    aihc_client.get_job_status("job-new", "p", "q")
+
     def test_unrelated_aihc_job_reference_is_not_a_create_receipt(self):
         with patch.object(aihc_client, "_run_output", return_value="uploaded diagnostics for old job-abc") as invoke:
             with self.assertRaises(RuntimeError):
