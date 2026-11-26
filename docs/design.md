@@ -241,7 +241,8 @@ unresolved row prevents idle exit even after STOP. A failed admission query
 backs off its pool. Pools sharing a Volc GPU budget still respect each other's
 reservations.
 
-**Worker startup.** A managed worker checks its environment request ID
+**Worker startup.** With no explicit `--worker-id`, the worker CLI uses
+`SHARDQ_REQUEST_ID` when present. A managed worker checks its environment request ID
 against the scheduler's row, then atomically publishes its own startup receipt
 in `workers/<id>.starts/`. It may claim immediately during `submitting`,
 `uncertain` or `confirmed`. It rechecks the state before seeking more work.

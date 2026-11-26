@@ -478,7 +478,7 @@ def main(argv: List[str] = None) -> int:
             root = _root(args.root)
             pools_path = _optional_pools_path(args, root)
             pool = _pool_from_ledger(root, args.pool, pools_path)
-            worker_id = args.worker_id or default_worker_id(args.pool)
+            worker_id = args.worker_id or os.environ.get("SHARDQ_REQUEST_ID") or default_worker_id(args.pool)
             return run_worker(
                 root,
                 args.pool,

@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from shardq.backends.fake import FakeBackend
+from shardq.cli import main
 from shardq.launchers.local import LocalLauncher
 from shardq.ledger import Ledger, atomic_write_json, read_json
 from shardq.spec import pool_from_dict
@@ -128,6 +129,16 @@ class WorkerHandshakeTests(unittest.TestCase):
             self.assertEqual(run_worker(self.root, "pool", "direct", 30, 0), 0)
         self.assertFalse(self.worker_record("direct").exists())
         self.assertFalse((self.root / "workers/direct.starts").exists())
+        self.assertEqual(self.ledger.scan_job("job", 110).partitions["p"].done, 1)
+
+    def test_managed_cli_uses_request_id_when_entry_omits_worker_id(self):
+        self.submitting("early")
+        self.ledger.cut("job", "p", 1, 1, 100)
+        with patch.dict(os.environ, {"SHARDQ_REQUEST_ID": "early"}):
+            self.assertEqual(main(["worker", "--root", str(self.root), "--pool", "pool",
+                                   "--max-wall-seconds", "60", "--idle-exit-seconds", "1"]), 0)
+        receipt, = (self.root / "workers/early.starts").glob("*.json")
+        self.assertEqual(read_json(receipt)["worker_id"], "early")
         self.assertEqual(self.ledger.scan_job("job", 110).partitions["p"].done, 1)
 
     def test_local_worker_receipt_matches_submitted_process_after_exit(self):
