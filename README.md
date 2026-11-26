@@ -81,7 +81,8 @@ setup budget with the original partition ranges and attempt history.
 
 For an existing ledger, stop the old scheduler and drain old workers, including
 queued submissions, before starting the upgraded writers. Existing pools,
-snapshots, jobs and attempts can be used in place.
+snapshots, jobs and attempts can be used in place. Workers recompute session
+compatibility, including the actual Script `run_command`, on each claim.
 
 Use a POSIX shared filesystem with coherent cross-host `flock`, symbolic links
 and atomic same-directory file rename. A worker publishes a fully initialized

@@ -23,6 +23,7 @@ FAILURE_REASONS = {
     "backend_error",
     "validation_error",
     "session_error",
+    "worker_restart",
 }
 PREEMPTION_REASONS = {"preempted", "lease_expired", "launcher_terminal"}
 SAMPLE_ERROR_REASONS = {"backend_error", "validation_error"}
@@ -141,7 +142,7 @@ def shard_state(shard_dir: Path, now: float) -> ShardState:
     if os.path.lexists(shard_dir / "lease"):
         return ShardState.LEASED
     failures = [row for row in _attempt_failures(shard_dir)
-                if row.get("reason") != "session_error"]
+                if row.get("reason") not in {"session_error", "worker_restart"}]
     if failures:
         latest = max(failures, key=lambda row: float(row.get("failed_unix", 0)))
         if float(latest.get("retry_after_unix", 0)) > now:
@@ -219,7 +220,7 @@ class Ledger:
             if row.get("reason") == "session_error" and row.get("setup_epoch", "") == setup_epoch
         ]
         latest_failure = max(
-            (row for row in failures if row.get("reason") != "session_error"),
+            (row for row in failures if row.get("reason") not in {"session_error", "worker_restart"}),
             key=lambda row: float(row.get("failed_unix", 0)), default={},
         )
         retry_after = float(latest_failure.get("retry_after_unix", 0))

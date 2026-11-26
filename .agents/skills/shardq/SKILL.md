@@ -40,12 +40,15 @@ description: Use when asked to run, monitor, debug, or extend ShardQ, the filesy
   (`min_units = max_units = 1`) should set `lookahead` at least as high as the desired
   worker count.
 - Which job a worker serves is decided at claim time, in this order: same partition as
-  its last shard, same `session_key` (model already loaded), higher job `priority`, fewer
+  its last shard, same registered `session_key`, higher job `priority`, fewer
   remaining shards, shards without prior failures, lower start unit. A worker with a
   loaded model keeps draining that model's jobs even when a higher-priority job with a
   different `session_key` appears; only a fresh worker follows priority first. Equal
   priorities interleave. To serialize benchmarks, `shardq stop` the ones that must wait
   or give them distinct priorities.
+- At execution time the worker verifies backend identity and the effective session
+  settings again. A legacy saved key can affect ordering. Script jobs with different
+  commands open different sessions even if their explicit labels match.
 
 ## Preflight, every session
 

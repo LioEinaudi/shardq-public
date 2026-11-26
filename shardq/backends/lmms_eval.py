@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import subprocess
@@ -12,7 +11,10 @@ from typing import List, Optional, Tuple
 
 from ..ledger import atomic_write_json
 from ..spec import PoolSpec
-from .base import Backend, Partition, RangeResult, RangeValidationError, validate_unit_ids
+from .base import (
+    Backend, Partition, RangeResult, RangeValidationError, WorkerRestartRequired,
+    session_fingerprint, validate_unit_ids,
+)
 
 
 def _public_scalars(metrics: dict) -> dict:
@@ -131,6 +133,7 @@ class _LmmsSession:
 
 class LmmsEvalBackend(Backend):
     name = "lmms_eval"
+    _session_source: Optional[Tuple[Path, Optional[str]]] = None
 
     @staticmethod
     def _git(root: Path, *arguments: str, optional: bool = False) -> Optional[str]:
@@ -337,21 +340,30 @@ class LmmsEvalBackend(Backend):
         ]
 
     def session_key(self) -> str:
-        payload = json.dumps(
-            [
-                self.model,
-                self.model_args,
-                self.gen_kwargs,
-                self.batch_size,
-                self.pins.get("lmms_commit"),
-            ],
-            ensure_ascii=False,
-            separators=(",", ":"),
+        return session_fingerprint(
+            self.name,
+            self.model,
+            self.model_args,
+            self.gen_kwargs,
+            self.batch_size,
+            self.force_simple,
+            self.bootstrap_iters,
+            self.pins.get("lmms_root"),
+            self.pins.get("lmms_commit"),
         )
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
     def open_session(self) -> _LmmsSession:
         self._configure_path()
+        root = Path(self.pins["lmms_root"]).resolve()
+        source = (root, self.pins.get("lmms_commit"))
+        # Python keeps the previously imported lmms_eval modules after Session.close().
+        if LmmsEvalBackend._session_source not in (None, source):
+            raise WorkerRestartRequired(f"lmms source pin changed to {source}; start a fresh worker")
+        import lmms_eval
+
+        origin = getattr(lmms_eval, "__file__", None)
+        if not origin or not Path(origin).resolve().is_relative_to(root):
+            raise RuntimeError(f"lmms_eval imported from {origin!r}, expected source under {root}")
         from lmms_eval import models
         from lmms_eval.tasks import TaskManager
 
@@ -360,7 +372,9 @@ class LmmsEvalBackend(Backend):
             {"batch_size": self.batch_size, "max_batch_size": None, "device": None},
         )
         manager = TaskManager("INFO", model_name=self.model)
-        return _LmmsSession(self, lm, manager)
+        session = _LmmsSession(self, lm, manager)
+        LmmsEvalBackend._session_source = source
+        return session
 
     def validate_range(self, partition: str, start: int, count: int, result: RangeResult) -> None:
         validate_unit_ids(result.records_file, start, count)

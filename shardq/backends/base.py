@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -9,6 +10,15 @@ from typing import Dict, List, Optional, Protocol
 
 class RangeValidationError(RuntimeError):
     pass
+
+
+class WorkerRestartRequired(RuntimeError):
+    """An earlier session loaded process-global state incompatible with this job."""
+
+
+def session_fingerprint(*settings: object) -> str:
+    payload = json.dumps(settings, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -69,6 +79,7 @@ class Backend(ABC):
 
     @abstractmethod
     def session_key(self) -> str:
+        """Identify the effective settings captured by open_session()."""
         raise NotImplementedError
 
     @abstractmethod

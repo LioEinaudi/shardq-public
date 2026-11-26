@@ -84,8 +84,9 @@ then `$SHARDQ_POOLS`, then `<root>/pools.json`, else error. Any `ValueError`,
 - Pool configuration comes from the pools file, or from the job's `pool_snapshot` when
   no pools file is reachable.
 - After claim, heartbeats cover setup and execution every 60 seconds or half the
-  job's TTL, whichever is shorter. The worker opens or reuses its session, runs
-  the range, validates coverage and writes `complete.json`.
+  job's TTL, whichever is shorter. The worker checks backend identity and the
+  runtime session key before reuse, runs the range, validates exact coverage of
+  `[start, start + count)` and writes `complete.json`.
 - Exits when the remaining wall clock is under 1.5 times the next shard estimate, or
   after `idle-exit-seconds` without a claim.
 - `SIGTERM` or `SIGINT` writes a `preempted` failure for the active attempt and exits 143.

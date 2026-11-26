@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .backends import get_backend
-from .backends.base import RangeValidationError
+from .backends.base import RangeValidationError, WorkerRestartRequired
 from .ledger import Claim, Ledger, ShardState, read_json
 from .spec import PoolSpec, load_pools, pool_from_dict, resolve_pools_path
 
@@ -105,7 +105,8 @@ def run_worker(
     deadline = time.time() + max_wall_seconds
     idle = 0.0
     session = None
-    session_key = None
+    session_identity = None
+    prefer_session_key = None
     prefer_partition = None
     active_claim = None
 
@@ -135,7 +136,7 @@ def run_worker(
                 allowed_jobs,
                 _identity(root, pool_spec, worker_id),
                 prefer_partition,
-                session_key,
+                prefer_session_key,
             )
             if claim is None:
                 if idle >= idle_exit_seconds:
@@ -156,13 +157,20 @@ def run_worker(
                         asdict(pool_spec),
                         dict(job_spec.get("pins") or {}),
                     )
-                    if session is None or session_key != claim.session_key:
+                    # The saved key is an affinity hint and may predate the current backend.
+                    prefer_session_key = claim.session_key
+                    identity = (job_spec["backend"], backend.session_key())
+                    if session is None or session_identity != identity:
                         if session is not None:
                             previous_session, session = session, None
                             previous_session.close()
                         session = backend.open_session()
-                        session_key = claim.session_key
-                except Exception:
+                        session_identity = identity
+                except Exception as exc:
+                    if isinstance(exc, WorkerRestartRequired) and session_identity is not None:
+                        ledger.fail(claim, "worker_restart", True, str(exc), 0, time.time())
+                        active_claim = None
+                        return 0
                     ledger.fail(
                         claim, "session_error", True, traceback.format_exc()[-4000:],
                         int(current_retry.get("backoff_seconds", 300)), time.time(),

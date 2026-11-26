@@ -24,9 +24,10 @@ range on request and emit one record per index.
   `$SHARDQ_OUT_DIR/results.json` shaped as
   `{"results": {"<partition>": {"<metric>": value, ...}}}`; ShardQ copies the partition's
   metrics into `merge.json` and the marker.
-- `session_key` (optional string, default `any`): workers keep claiming shards with the
-  same key. For the script backend each range is a fresh process, so this is only a
-  grouping hint.
+- `session_key` is an optional grouping label, defaulting to `any`. The execution
+  key fingerprints the Script backend, this label and the exact `run_command`.
+  Identical commands and labels can reuse the session wrapper. Every range still
+  starts its own subprocess. Different commands always open separate sessions.
 
 Unit ids are absolute partition indices, `0 .. size - 1`. A non-zero exit from
 `run_command` is a `backend_error` (the last 4000 characters of stderr are kept in

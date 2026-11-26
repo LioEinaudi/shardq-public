@@ -137,8 +137,20 @@ setup fields. Old splits, quarantines and completed results retain their state.
 
 A worker claims from unstopped jobs matching its pool. Candidate ordering keeps
 partition and session locality, then considers job priority, remaining shards,
-prior failures, and start unit. A backend session is rebuilt only when
-`session_key` changes. A completed range must cover exactly its absolute
+prior failures, and start unit. The registered key still guides that ordering
+and keys runtime history. The worker independently derives its reuse identity
+from the job's backend and the effective settings captured by the session.
+Script hashes the run command and its optional grouping label, Fake includes
+the unit duration and poison configuration, and lmms includes model settings,
+evaluation settings and pinned source. New registrations persist the new keys.
+History for a newly keyed configuration starts from its normal estimate.
+Python retains imported modules across session closes. A worker that already
+loaded a different lmms source pin records `worker_restart`, releases the claim
+and exits. The next worker can load that pin in a fresh interpreter. This
+handoff consumes no retry budget. On first load, importing lmms from outside
+the requested root produces a setup error. Keep a verify-mode checkout at its
+registered revision until the job finishes.
+A completed range must cover exactly its absolute
 `unit_id` interval before `complete.json` is written. SIGTERM and SIGINT
 write a `preempted` failure record and exit.
 

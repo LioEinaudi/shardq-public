@@ -60,6 +60,7 @@ per shard, breaking timestamp ties by attempt ID.
 | `backend_error` | worker when `run_range` raises or the command fails | max_errors |
 | `validation_error` | worker when records do not cover the range | max_errors |
 | `session_error` | worker during backend or session setup, e.g. model load | job-wide max_session_errors |
+| `worker_restart` | already-loaded lmms source requires a fresh worker for another pin | none |
 
 `failed.json` holds `attempt_id`, `worker_id`, `handle`, `reason`, `retryable`, `error`
 (last 4000 characters of the traceback or stderr), `failed_unix`, `retry_after_unix`.
