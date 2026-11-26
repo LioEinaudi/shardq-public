@@ -11,6 +11,10 @@ class TransientSubmitError(RuntimeError):
     """Submission was rejected before any task was created; safe to retry."""
 
 
+class SubmissionChangedError(RuntimeError):
+    """Local request material differs from the intent, before calling the provider."""
+
+
 class CommandError(RuntimeError):
     """Keep the provider response separate from command paths and arguments."""
 

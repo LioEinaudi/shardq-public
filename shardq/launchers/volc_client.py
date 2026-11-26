@@ -122,12 +122,15 @@ def list_tasks(queue: str, creator: str) -> List[dict]:
             ["list", "--limit", "100", "--offset", str(offset), "-o", "json"]
         )
         for row in page:
-            task_id = str(row.get("JobId", ""))
-            if not task_id or task_id in seen:
-                continue
+            task_id = row.get("JobId") if isinstance(row, dict) else None
+            if (not isinstance(task_id, str) or not task_id or task_id in seen
+                    or not row.get("ResourceQueueId")):
+                raise ValueError("incomplete Volc capacity listing: missing identity/queue or repeated task")
             seen.add(task_id)
             if row.get("ResourceQueueId") != queue:
                 continue
+            if not row.get("Creator"):
+                raise ValueError("incomplete Volc capacity listing: missing task creator")
             if row.get("Creator") != creator:
                 continue
             if str(row.get("Status")) in TERMINAL:

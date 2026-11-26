@@ -84,6 +84,32 @@ class CloudRecoveryTests(unittest.TestCase):
             path.write_text("TaskName: other\n")
             self.assertNotEqual(before, launcher.submission_inputs())
 
+    def test_volc_audit_rejects_repeated_or_unidentifiable_pages(self):
+        page = [{"JobId": f"t-{i}", "ResourceQueueId": "other", "Creator": "owner"}
+                for i in range(100)]
+        for pages in ([page, page, []], [[{}]]):
+            with self.subTest(pages=len(pages)), patch.object(volc_client, "run_volc", side_effect=pages):
+                with self.assertRaisesRegex(ValueError, "incomplete"):
+                    volc_client.list_tasks("q", "owner")
+
+    def test_changed_volc_template_stops_before_external_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "worker.yaml"
+            path.write_text("TaskName: {TASK_NAME}\n")
+            pool = pool_from_dict("p", {"launcher": "volc", "backend": "fake", "entry": "/entry",
+                                        "volc": {"template": str(path), "image": "i", "flavor": "f",
+                                                 "queue": "q", "vepfs_id": "v"}})
+            launcher = VolcLauncher(root, pool, root)
+            (root / "workers").mkdir()
+            row = {"worker_id": "w", "request_id": "w", "launcher_inputs": launcher.submission_inputs()}
+            (root / "workers/w.json").write_text(json.dumps(row))
+            path.write_text("TaskName: different\n")
+            with patch.object(volc_client, "submit", return_value="t-other") as invoke:
+                with self.assertRaisesRegex(RuntimeError, "template"):
+                    launcher.submit("w", [], {"SHARDQ_REQUEST_ID": "w"})
+                invoke.assert_not_called()
+
 
 class LocalLookupTests(unittest.TestCase):
     def setUp(self):
@@ -132,3 +158,17 @@ class LocalLookupTests(unittest.TestCase):
         handle = local.local_process_handle(os.getpid())
         earlier = handle.rsplit(":", 1)[0] + ":0"
         self.assertTrue(self.launcher.status(earlier).startswith("terminal:"))
+
+    def test_local_ack_and_legacy_pid_status_without_procfs(self):
+        self.launcher.repo_root = Path(__file__).resolve().parents[1]
+        with patch.object(local, "local_process_handle", side_effect=FileNotFoundError("no procfs")):
+            try:
+                handle = self.launcher.submit("w", ["--help"], {"SHARDQ_REQUEST_ID": "r"})
+            finally:
+                for process in self.launcher.processes.values():
+                    process.wait(timeout=10)
+        pid, = self.launcher.processes
+        self.assertEqual(handle, f"local:{pid}")
+        self.assertEqual(self.launcher.status(handle), "terminal:0")
+        with patch.object(local, "_process_stat", side_effect=FileNotFoundError("no procfs")):
+            self.assertEqual(self.launcher.status(f"local:{os.getpid()}"), "running")

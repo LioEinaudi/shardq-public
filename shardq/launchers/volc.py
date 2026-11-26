@@ -7,8 +7,9 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from ..fs import atomic_write_text
+from ..ledger import read_json
 from . import volc_client
-from .base import Launcher
+from .base import Launcher, SubmissionChangedError
 
 
 class VolcLauncher(Launcher):
@@ -63,7 +64,14 @@ class VolcLauncher(Launcher):
             "ACTIVE_DEADLINE": self.pool.worker_max_wall_seconds + 1800,
             "VEPFS_ID": self.pool.volc["vepfs_id"],
         }
-        rendered = self._template_text().format_map(values)
+        template = self._template_text()
+        if env.get("SHARDQ_REQUEST_ID"):
+            record = read_json(self.root / "workers" / f"{worker_id}.json", {})
+            digest = hashlib.sha256(template.encode("utf-8")).hexdigest()
+            if (record.get("request_id") != env["SHARDQ_REQUEST_ID"]
+                    or (record.get("launcher_inputs") or {}).get("template_sha256") != digest):
+                raise SubmissionChangedError("Volc template differs from the recorded submission intent")
+        rendered = template.format_map(values)
         config = self.root / "workers" / f"{worker_id}.yaml"
         atomic_write_text(config, rendered)
         return volc_client.submit(config)

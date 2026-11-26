@@ -18,8 +18,11 @@ _GENERATION = re.compile(r"local:([1-9][0-9]*):([^:]+):([0-9a-fA-F-]{36}):([0-9]
 
 def _process_stat(pid: int) -> List[str]:
     # The comm field is parenthesized and can contain both spaces and ')'.
-    record = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    return record.rsplit(")", 1)[1].split()
+    record = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="surrogateescape")
+    fields = record.rpartition(")")[2].split()
+    if len(fields) < 20 or not fields[19].isdigit():
+        raise OSError(f"cannot read process generation for PID {pid}")
+    return fields
 
 
 def _boot_id() -> str:
@@ -54,7 +57,11 @@ class LocalLauncher(Launcher):
             )
         self.processes[process.pid] = process
         if env.get("SHARDQ_REQUEST_ID"):
-            return local_process_handle(process.pid)
+            try:
+                return local_process_handle(process.pid)
+            except OSError:
+                # The child exists and its PID is known even without Linux procfs.
+                pass
         return f"local:{process.pid}"
 
     def submission_inputs(self) -> dict:
@@ -109,9 +116,14 @@ class LocalLauncher(Launcher):
         if process is not None:
             code = process.poll()
             return "running" if code is None else f"terminal:{code}"
+        if generation:
+            return "terminal:zombie" if stat[0] == "Z" else "running"
         try:
             if _process_stat(pid)[0] == "Z":
                 return "terminal:zombie"
+        except FileNotFoundError:
+            pass  # A legacy PID can also come from a host without procfs.
+        try:
             os.kill(pid, 0)
             return "running"
         except (FileNotFoundError, ProcessLookupError):
