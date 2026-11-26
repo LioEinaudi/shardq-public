@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import shlex
 from importlib import resources
 from pathlib import Path
@@ -38,6 +39,9 @@ class VolcLauncher(Launcher):
             "volc_worker.yaml.tmpl"
         )
         return template.read_text(encoding="utf-8")
+
+    def submission_inputs(self) -> dict:
+        return {"template_sha256": hashlib.sha256(self._template_text().encode("utf-8")).hexdigest()}
 
     def submit(
         self, worker_id: str, worker_argv: List[str], env: Dict[str, str]

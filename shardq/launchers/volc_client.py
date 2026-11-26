@@ -8,10 +8,10 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List
 
-from .base import TransientSubmitError
+from .base import CommandError, TransientSubmitError
 
 
-FLOW_CONTROL_MARKER = "beyond the current flow control limit"
+FLOW_CONTROL_REJECTION = "request was rejected: beyond the current flow control limit"
 SUBMIT_RETRIES = 5
 TERMINAL = {
     "Success",
@@ -55,10 +55,7 @@ def _run_output(arguments: List[str], timeout: int = 120) -> str:
         timeout=timeout,
     )
     if proc.returncode:
-        raise RuntimeError(
-            f"volc {' '.join(arguments)} failed ({proc.returncode}): "
-            f"{proc.stdout[-2000:]}"
-        )
+        raise CommandError(f"volc {' '.join(arguments)}", proc.returncode, proc.stdout)
     return proc.stdout
 
 
@@ -69,28 +66,25 @@ def run_volc(
 
 
 def _parse_submit_task_id(output: str) -> str:
-    match = _TASK_ID_PATTERN.search(output)
-    if match:
-        return match.group(1)
-    for index, character in enumerate(output):
-        if character not in "[{":
-            continue
-        try:
-            payload = json.loads(output[index:])
-        except json.JSONDecodeError:
-            continue
+    ids = set(_TASK_ID_PATTERN.findall(output))
+    # The CLI can prefix its JSON with log messages. Once the document starts,
+    # parse it as one receipt: skipping to a later object can hide a conflict.
+    start = re.search(r'\[\s*(?=[{\]])|\{\s*(?=")', output)
+    if start:
+        payload = json.loads(output[start.start():])
         candidates = payload if isinstance(payload, list) else [payload]
         for candidate in candidates:
-            if not isinstance(candidate, dict):
-                continue
-            task_id = (
-                candidate.get("Id")
-                or candidate.get("JobId")
-                or candidate.get("task_id")
-            )
-            if task_id:
-                return str(task_id)
-    raise ValueError(f"submission output has no task id: {output[-1000:]}")
+            if not isinstance(candidate, dict) or not candidate.keys() & {"Id", "JobId", "task_id"}:
+                raise ValueError(f"invalid submission receipt: {output[-1000:]}")
+            for key in ("Id", "JobId", "task_id"):
+                if key in candidate:
+                    value = candidate[key]
+                    if not isinstance(value, str) or not re.fullmatch(r"t-[A-Za-z0-9-]+", value):
+                        raise ValueError(f"invalid task id in submission output: {output[-1000:]}")
+                    ids.add(value)
+    if len(ids) != 1:
+        raise ValueError(f"expected one task id in submission output: {output[-1000:]}")
+    return ids.pop()
 
 
 def submit(conf_path: Path) -> str:
@@ -100,7 +94,8 @@ def submit(conf_path: Path) -> str:
                 ["submit", "--conf", str(Path(conf_path)), "-o", "json"]
             )
         except RuntimeError as exc:
-            if FLOW_CONTROL_MARKER not in str(exc):
+            response = exc.output if isinstance(exc, CommandError) else str(exc)
+            if response.strip().lower() != FLOW_CONTROL_REJECTION:
                 raise
             if attempt == SUBMIT_RETRIES:
                 raise TransientSubmitError(str(exc)) from exc
