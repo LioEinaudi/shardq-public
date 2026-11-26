@@ -73,6 +73,10 @@ failure's `retry_after_unix` selects `PENDING_BACKOFF` or `PENDING`.
 `lease/` is acquired with atomic `os.mkdir`. Heartbeats contain Unix seconds
 and do not depend on filesystem mtime.
 
+Published files use unique temporary names in the destination directory and
+clean them up on ordinary errors. Process death can leave an unpublished
+temporary file.
+
 `read_json` returns its default for ledger files deleted during a read or
 containing incomplete content; the next tick re-derives state so transient
 scan results recover. An exception from an individual scheduler tick is logged

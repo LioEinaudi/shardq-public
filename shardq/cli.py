@@ -17,6 +17,7 @@ from typing import Dict, List, Optional
 
 from .backend_exec import run_backend_op
 from .controller import run_scheduler
+from .fs import atomic_output, atomic_write_text
 from .ledger import Ledger, atomic_write_json, read_json
 from .merge import merge_partition
 from .register import register
@@ -36,16 +37,8 @@ def _root(value: Optional[str]) -> Path:
 
 
 def _atomic_copy(source: Path, target: Path) -> None:
-    temporary = target.with_name(f"{target.name}.tmp-{os.getpid()}")
-    shutil.copy2(str(source), str(temporary))
-    os.replace(str(temporary), str(target))
-
-
-def _atomic_write_text(path: Path, value: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.tmp-{os.getpid()}")
-    temporary.write_text(value, encoding="utf-8")
-    os.replace(str(temporary), str(path))
+    with atomic_output(target) as temporary:
+        shutil.copy2(source, temporary)
 
 
 def _parse_sizes(values: Optional[List[str]]) -> Optional[Dict[str, int]]:
@@ -324,7 +317,7 @@ def _publish(root: Path, job_id: str, out_dir: Path) -> dict:
             },
         },
     )
-    _atomic_write_text(
+    atomic_write_text(
         run_dir / "summary.md",
         f"# {run_id}\n\nShardQ job `{job_id}` published "
         f"with status `{status}`.\n",
@@ -526,10 +519,7 @@ def main(argv: List[str] = None) -> int:
         if args.command in {"stop", "resume"}:
             path = Ledger(_root(args.root)).job_dir(args.job) / "STOP"
             if args.command == "stop":
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(
-                    f"stopped_unix={time.time()}\n", encoding="utf-8"
-                )
+                atomic_write_text(path, f"stopped_unix={time.time()}\n")
             else:
                 try:
                     path.unlink()

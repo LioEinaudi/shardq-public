@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable, List, Set
 
 from .backend_exec import run_backend_op
+from .fs import atomic_output
 from .ledger import JobView, Ledger, PartitionView, ShardState, atomic_write_json, read_json
 from .spec import PoolSpec
 
@@ -74,12 +74,9 @@ def coverage(records: List[dict], size: int, quarantined_units: Set[int]) -> dic
 
 
 def _write_records(path: Path, rows: List[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.tmp-{os.getpid()}")
-    with temporary.open("w", encoding="utf-8") as handle:
+    with atomic_output(path) as temporary, temporary.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
-    os.replace(str(temporary), str(path))
 
 
 def _parse_generation_kwargs(value: object) -> dict:

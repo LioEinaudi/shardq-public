@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import os
 import shlex
 from importlib import resources
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from ..fs import atomic_write_text
 from . import volc_client
 from .base import Launcher
 
@@ -61,10 +61,7 @@ class VolcLauncher(Launcher):
         }
         rendered = self._template_text().format_map(values)
         config = self.root / "workers" / f"{worker_id}.yaml"
-        config.parent.mkdir(parents=True, exist_ok=True)
-        temporary = config.with_name(f"{config.name}.tmp-{os.getpid()}")
-        temporary.write_text(rendered, encoding="utf-8")
-        os.replace(str(temporary), str(config))
+        atomic_write_text(config, rendered)
         return volc_client.submit(config)
 
     def status(self, handle: str) -> str:

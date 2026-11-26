@@ -4,7 +4,6 @@ import fcntl
 import json
 import logging
 import math
-import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -15,6 +14,7 @@ from typing import Dict
 import shardq
 
 from .cutter import plan_cut, update_history
+from .fs import atomic_write_text
 from .launchers import get_launcher
 from .launchers.base import TransientSubmitError
 from .ledger import Ledger, ShardState, atomic_write_json, read_json
@@ -216,10 +216,7 @@ def _write_status(root: Path, state: dict) -> None:
             f"{worker.get('handle', '')} | {worker.get('last_status', '')} |"
         )
     path = root / "scheduler" / "status.md"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.tmp-{os.getpid()}")
-    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    os.replace(str(temporary), str(path))
+    atomic_write_text(path, "\n".join(lines) + "\n")
 
 
 def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict, now: float) -> dict:

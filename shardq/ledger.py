@@ -9,6 +9,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from .fs import atomic_write_json, atomic_write_text as _atomic_write_text
 from .spec import slug
 
 
@@ -89,17 +90,6 @@ class JobView:
     column: str
     stopped: bool
     partitions: Dict[str, PartitionView]
-
-
-def _atomic_write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.tmp-{os.getpid()}")
-    temporary.write_text(content, encoding="utf-8")
-    os.replace(str(temporary), str(path))
-
-
-def atomic_write_json(path: Path, payload: Any) -> None:
-    _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
 
 def read_json(path: Path, default: Any = None) -> Any:
