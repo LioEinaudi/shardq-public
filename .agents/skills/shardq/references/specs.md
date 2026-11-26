@@ -27,13 +27,15 @@ maximum number of shards cut per partition per tick, further bounded by
 For one-unit shards (`min_units = max_units = 1`), set `lookahead` at least as high as
 the desired worker count so cutting can supply enough shards for scale-up.
 
-`retry` defaults: `max_errors` 3, `max_preemptions` 20, `backoff_seconds` 300,
-`bisect` true, `lease_ttl_seconds` 900. Exceeding either limit bisects the shard while
+`retry` defaults include `max_errors` 3, `max_preemptions` 20, `backoff_seconds` 300,
+`max_session_errors` 3, `bisect` true and `lease_ttl_seconds` 900. Reaching the
+sample or preemption limit bisects the shard while
 `bisect` is true, it has more than one unit, and depth is below `log2(max_units)`;
 otherwise it is quarantined. `backoff_seconds` delays re-claiming after a failure.
-Choose a TTL that allows for heartbeat jitter and clock skew. A lease older
-than the TTL is released if the launcher no longer reports a live worker,
-or unconditionally after two TTLs.
+A setup error backs off the whole job for `backoff_seconds`. Reaching
+`max_session_errors` pauses the job until `resume`. Choose a TTL that allows for
+heartbeat jitter and clock skew. A lease older than the TTL is released if the
+launcher no longer reports a live worker, or unconditionally after two TTLs.
 
 `traits.<partition>.max_parallel` caps concurrently leased shards of that partition.
 

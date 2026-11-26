@@ -34,7 +34,9 @@ def render_status(root: Path, job_id: Optional[str], as_json: bool) -> str:
     for job in jobs:
         lines.extend(
             [
-                f"Job {job['job_id']} (pool={job['pool']}, column={job['column']}, stopped={job['stopped']})",
+                f"Job {job['job_id']} (pool={job['pool']}, column={job['column']}, stopped={job['stopped']}, "
+                f"setup={job['setup_status']}, session_errors={job['session_errors']}, "
+                f"session_retry_after_unix={job['session_retry_after_unix']})",
                 "partition\tsize\tdone_units\tdone\tleased\tpending\tbackoff\tquarantined\test_s/unit\tstatus",
             ]
         )

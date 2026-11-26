@@ -52,6 +52,7 @@ The root is always supplied by `--root` or `SHARDQ_ROOT`. Its format is:
 
 ```text
 jobs/<job>/job.json
+jobs/<job>/setup_epoch.json                  # created by resume
 jobs/<job>/partitions/<partition>/partition.json
 jobs/<job>/partitions/<partition>/partition.lock
 jobs/<job>/partitions/<partition>/shards/<shard>/
@@ -75,7 +76,7 @@ A shard's state follows the first matching condition in this order.
 2. A completed attempt gives `DONE`.
 3. A quarantine marker gives `QUARANTINED`.
 4. A current lease entry gives `LEASED`.
-5. The newest failure's retry time selects `PENDING_BACKOFF` or `PENDING`.
+5. The newest range failure's retry time selects `PENDING_BACKOFF` or `PENDING`.
 
 **Lease publication and release.** Each writer opens the shard's permanent
 `lease.lock` file and takes an exclusive `flock` for the mutation. Claim checks
@@ -129,7 +130,8 @@ Upgrade an existing ledger in place after draining all old writers, including
 queued workers. Mixed-version writers are unsupported because old workers
 bypass the shard and partition locks. Old `pool_snapshot` objects with
 top-level `column` and `lmms_root` are normalized when a worker must recover
-configuration from a snapshot.
+configuration from a snapshot. The attempt and job formats accept absent
+setup fields. Old splits, quarantines and completed results retain their state.
 
 ## Worker loop
 
@@ -151,10 +153,27 @@ scheduler per ledger.
 A lease can expire after one TTL when the launcher no longer reports a live
 worker, or after two TTLs regardless of launcher state. Heartbeats run through
 session setup, execution and validation at most half a TTL apart by default.
-Preemption-like
-failures count toward `max_preemptions`; other failures count toward
-`max_errors`. A terminal partition with missing quarantined units can only
+Preemption-like failures count toward `max_preemptions`. Backend range and
+validation failures count toward `max_errors`. A terminal partition with missing quarantined units can only
 produce a `partial` marker. `--require-complete` refuses that merge.
+
+**Session setup budget.** Backend construction or session initialization
+failures produce auditable `session_error` attempts. The scheduler and workers
+read the current job-wide setup epoch and aggregate matching failures across
+all its shards. `session_retry_after_unix` is the greatest retry time among
+those failures. The job enters `backoff` until that time, or `paused` once
+the cumulative count reaches `retry.max_session_errors` (default 3).
+The delay is `retry.backoff_seconds` (default 300 seconds). Blocked jobs
+contribute no new worker demand. Workers already dispatched can report more
+failures. Other jobs in the pool continue to supply work.
+
+`shardq resume --job JOB` starts a fresh setup epoch and clears a manual STOP.
+Each claim captures its epoch so failures from earlier claims stay in their
+original budget. Missing epochs denote the initial cycle, including earlier
+`session_error` records. The CLI and scheduler expose `setup_status`,
+`session_errors` and `session_retry_after_unix`. Restarting the scheduler
+reconstructs all three from the ledger. A batch scheduler waits through
+temporary backoff and may exit with paused jobs once workers and leases drain.
 
 ## Pool configuration
 

@@ -50,7 +50,7 @@ def _next_estimate(ledger: Ledger, pool: str, job_ids: List[str], now: float) ->
     estimates = []
     for job_id in job_ids or ledger.list_jobs():
         job = ledger.scan_job(job_id, now)
-        if job.pool != pool or job.stopped:
+        if job.pool != pool or job.claims_blocked:
             continue
         for partition in job.partitions.values():
             for shard in partition.shards:
@@ -150,28 +150,25 @@ def run_worker(
             current_retry = dict(job_spec.get("retry") or {})
             interval = min(heartbeat_seconds, float(current_retry.get("lease_ttl_seconds", 900)) / 2)
             with _maintain_lease(ledger, claim, interval):
-                backend = get_backend(str(job_spec["backend"]))(
-                    dict(job_spec.get("backend_args") or {}),
-                    asdict(pool_spec),
-                    dict(job_spec.get("pins") or {}),
-                )
-                if session is None or session_key != claim.session_key:
-                    if session is not None:
-                        session.close()
-                    try:
+                try:
+                    backend = get_backend(str(job_spec["backend"]))(
+                        dict(job_spec.get("backend_args") or {}),
+                        asdict(pool_spec),
+                        dict(job_spec.get("pins") or {}),
+                    )
+                    if session is None or session_key != claim.session_key:
+                        if session is not None:
+                            previous_session, session = session, None
+                            previous_session.close()
                         session = backend.open_session()
                         session_key = claim.session_key
-                    except Exception:
-                        ledger.fail(
-                            claim,
-                            "session_error",
-                            True,
-                            traceback.format_exc()[-4000:],
-                            int(current_retry.get("backoff_seconds", 300)),
-                            time.time(),
-                        )
-                        active_claim = None
-                        return 2
+                except Exception:
+                    ledger.fail(
+                        claim, "session_error", True, traceback.format_exc()[-4000:],
+                        int(current_retry.get("backoff_seconds", 300)), time.time(),
+                    )
+                    active_claim = None
+                    return 2
                 started = time.time()
                 try:
                     result = session.run_range(

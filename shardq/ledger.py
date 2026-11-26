@@ -6,6 +6,7 @@ import math
 import os
 import shutil
 import time
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -24,6 +25,7 @@ FAILURE_REASONS = {
     "session_error",
 }
 PREEMPTION_REASONS = {"preempted", "lease_expired", "launcher_terminal"}
+SAMPLE_ERROR_REASONS = {"backend_error", "validation_error"}
 PARTITION_STATUSES = {"cutting", "cut", "merged", "partial"}
 
 
@@ -65,6 +67,8 @@ class ShardView:
     heartbeat_unix: Optional[float]
     complete_attempts: List[str]
     lease_present: bool = False
+    session_errors: int = 0
+    session_retry_after_unix: float = 0.0
 
 
 @dataclass
@@ -93,6 +97,14 @@ class JobView:
     column: str
     stopped: bool
     partitions: Dict[str, PartitionView]
+    setup_epoch: str = ""
+    setup_status: str = "ready"
+    session_errors: int = 0
+    session_retry_after_unix: float = 0.0
+
+    @property
+    def claims_blocked(self) -> bool:
+        return self.stopped or self.setup_status != "ready"
 
 
 def read_json(path: Path, default: Any = None) -> Any:
@@ -128,7 +140,8 @@ def shard_state(shard_dir: Path, now: float) -> ShardState:
         return ShardState.QUARANTINED
     if os.path.lexists(shard_dir / "lease"):
         return ShardState.LEASED
-    failures = _attempt_failures(shard_dir)
+    failures = [row for row in _attempt_failures(shard_dir)
+                if row.get("reason") != "session_error"]
     if failures:
         latest = max(failures, key=lambda row: float(row.get("failed_unix", 0)))
         if float(latest.get("retry_after_unix", 0)) > now:
@@ -196,12 +209,19 @@ class Ledger:
             return []
         return sorted(path.name for path in jobs.iterdir() if path.is_dir() and (path / "job.json").is_file())
 
-    def _scan_shard(self, shard_dir: Path, now: float) -> ShardView:
+    def _scan_shard(self, shard_dir: Path, now: float, setup_epoch: str) -> ShardView:
         metadata = read_json(shard_dir / "shard.json", {})
         failures = _attempt_failures(shard_dir)
-        errors = sum(str(row.get("reason")) not in PREEMPTION_REASONS for row in failures)
+        errors = sum(row.get("reason") in SAMPLE_ERROR_REASONS for row in failures)
         preemptions = sum(str(row.get("reason")) in PREEMPTION_REASONS for row in failures)
-        latest_failure = max(failures, key=lambda row: float(row.get("failed_unix", 0))) if failures else {}
+        setup_failures = [
+            row for row in failures
+            if row.get("reason") == "session_error" and row.get("setup_epoch", "") == setup_epoch
+        ]
+        latest_failure = max(
+            (row for row in failures if row.get("reason") != "session_error"),
+            key=lambda row: float(row.get("failed_unix", 0)), default={},
+        )
         retry_after = float(latest_failure.get("retry_after_unix", 0))
         lease = shard_dir / "lease"
         completed = sorted(path.parent.name for path in (shard_dir / "attempts").glob("*/complete.json"))
@@ -219,6 +239,8 @@ class Ledger:
             lease_present=os.path.lexists(lease),
             heartbeat_unix=_read_heartbeat(lease / "heartbeat"),
             complete_attempts=completed,
+            session_errors=len(setup_failures),
+            session_retry_after_unix=max((float(row.get("retry_after_unix", 0)) for row in setup_failures), default=0.0),
         )
 
     def scan_job(self, job_id: str, now: float) -> JobView:
@@ -226,6 +248,9 @@ class Ledger:
         spec = read_json(directory / "job.json")
         if not isinstance(spec, dict):
             raise ValueError(f"missing or invalid job.json for {job_id}")
+        setup_epoch = read_json(directory / "setup_epoch.json", "")
+        session_errors = 0
+        session_retry_after = 0.0
         partitions: Dict[str, PartitionView] = {}
         base = directory / "partitions"
         for partition_dir in sorted(base.iterdir() if base.is_dir() else []):
@@ -235,11 +260,14 @@ class Ledger:
             if not isinstance(metadata, dict):
                 continue
             shards = [
-                self._scan_shard(path, now)
+                self._scan_shard(path, now, setup_epoch)
                 for path in sorted((partition_dir / "shards").iterdir() if (partition_dir / "shards").is_dir() else [])
                 if path.is_dir() and (path / "shard.json").is_file()
             ]
             counts = {state: sum(shard.state == state for shard in shards) for state in ShardState}
+            for shard in shards:
+                session_errors += shard.session_errors
+                session_retry_after = max(session_retry_after, shard.session_retry_after_unix)
             name = str(metadata.get("name", partition_dir.name))
             partitions[name] = PartitionView(
                 name=name,
@@ -257,6 +285,11 @@ class Ledger:
                 done_units=sum(shard.count for shard in shards if shard.state == ShardState.DONE),
                 quarantined_units=sum(shard.count for shard in shards if shard.state == ShardState.QUARANTINED),
             )
+        setup_status = "ready"
+        if session_errors >= int((spec.get("retry") or {}).get("max_session_errors", 3)):
+            setup_status = "paused"
+        elif session_retry_after > now:
+            setup_status = "backoff"
         return JobView(
             job_id=job_id,
             spec=spec,
@@ -264,7 +297,20 @@ class Ledger:
             column=str(spec.get("column", "")),
             stopped=(directory / "STOP").exists(),
             partitions=partitions,
+            setup_epoch=setup_epoch,
+            setup_status=setup_status,
+            session_errors=session_errors,
+            session_retry_after_unix=session_retry_after,
         )
+
+    def resume(self, job_id: str) -> None:
+        directory = self.job_dir(job_id)
+        if not (directory / "job.json").is_file():
+            raise ValueError(f"unknown job: {job_id}")
+        # A generation rather than a timestamp also fences failures reported
+        # after resume by a worker which already held its claim.
+        atomic_write_json(directory / "setup_epoch.json", uuid.uuid4().hex)
+        (directory / "STOP").unlink(missing_ok=True)
 
     def claim(
         self,
@@ -279,7 +325,7 @@ class Ledger:
         candidates = []
         for job_id in job_ids or self.list_jobs():
             job = self.scan_job(job_id, scan_time)
-            if job.pool != pool or job.stopped:
+            if job.pool != pool or job.claims_blocked:
                 continue
             priority = int(job.spec.get("priority", 0))
             session_key = str(job.spec.get("session_key", ""))
@@ -320,10 +366,10 @@ class Ledger:
         job_dir = self.job_dir(job.job_id)
         shard_dir = job_dir / "partitions" / partition.name / "shards" / shard.shard_id
         with file_lock(shard_dir / "lease.lock"):
-            if (job_dir / "STOP").exists():
+            if (job_dir / "STOP").exists() or read_json(job_dir / "setup_epoch.json", "") != job.setup_epoch:
                 return None
             acquired = time.time() if now is None else now
-            current = self._scan_shard(shard_dir, acquired)
+            current = self._scan_shard(shard_dir, acquired, job.setup_epoch)
             if not _claimable(current, job.spec.get("retry") or {}):
                 return None
             attempt_epoch = int(acquired)
@@ -343,6 +389,7 @@ class Ledger:
                 "attempt_id": attempt_id,
                 "acquired_unix": float(acquired),
                 "session_key": session_key,
+                "setup_epoch": job.setup_epoch,
             }
             atomic_write_json(attempt_dir / "owner.json", owner)
             # Stage outside the backend-owned output directory. Reuse is safe:
@@ -430,6 +477,7 @@ class Ledger:
                     "handle": owner.get("handle", ""),
                     "failed_unix": now,
                     "reason": reason,
+                    **({"setup_epoch": owner.get("setup_epoch", "")} if reason == "session_error" else {}),
                     "retryable": bool(retryable),
                     "error": error,
                     "retry_after_unix": now + int(backoff_seconds),
@@ -588,7 +636,7 @@ class Ledger:
             shard_dir / "quarantine.json",
             {
                 "reason": reason,
-                "errors": sum(str(row.get("reason")) not in PREEMPTION_REASONS for row in failures),
+                "errors": sum(row.get("reason") in SAMPLE_ERROR_REASONS for row in failures),
                 "preemptions": sum(str(row.get("reason")) in PREEMPTION_REASONS for row in failures),
                 "quarantined_unix": now,
             },

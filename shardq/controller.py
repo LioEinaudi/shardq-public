@@ -61,7 +61,7 @@ def _last_failure_reason(shard_dir: Path) -> str:
     failures = []
     for path in (shard_dir / "attempts").glob("*/failed.json"):
         payload = read_json(path, {})
-        if isinstance(payload, dict):
+        if isinstance(payload, dict) and payload.get("reason") != "session_error":
             failures.append(payload)
     if not failures:
         return "backend_error"
@@ -177,6 +177,9 @@ def _job_summary(job) -> dict:
         "pool": job.pool,
         "column": job.column,
         "stopped": job.stopped,
+        "setup_status": job.setup_status,
+        "session_errors": job.session_errors,
+        "session_retry_after_unix": job.session_retry_after_unix,
         "partitions": {
             name: {
                 "size": row.size,
@@ -200,7 +203,10 @@ def _job_summary(job) -> dict:
 def _write_status(root: Path, state: dict) -> None:
     lines = ["# ShardQ scheduler status", "", f"Updated unix: {state['updated_unix']}", ""]
     for job in state["jobs"]:
-        lines.extend([f"## {job['job_id']}", "", "| partition | size | cut | done units | pending | leased | quarantined | status |", "|---|---:|---:|---:|---:|---:|---:|---|"])
+        lines.extend([f"## {job['job_id']}", ""])
+        if job["setup_status"] != "ready":
+            lines.extend([f"Session setup {job['setup_status']} ({job['session_errors']} failures).", ""])
+        lines.extend(["| partition | size | cut | done units | pending | leased | quarantined | status |", "|---|---:|---:|---:|---:|---:|---:|---|"])
         for name, row in job["partitions"].items():
             lines.append(
                 f"| {name} | {row['size']} | {row['next_cut']} | {row['done_units']} | "
@@ -268,7 +274,7 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
     max_cuts = int(opts.get("max_cuts_per_tick", 64))
     for job_id in job_ids:
         job = ledger.scan_job(job_id, now)
-        if job.stopped:
+        if job.claims_blocked:
             continue
         shard_cfg = job.spec.get("shard") or {}
         lookahead = int(shard_cfg.get("lookahead", 4))
@@ -337,7 +343,7 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
         pool = pools[pool_name]
         if float(backoff.get(pool_name, 0)) > now:
             continue
-        pool_jobs = [job for job in current_jobs if job.pool == pool_name and not job.stopped]
+        pool_jobs = [job for job in current_jobs if job.pool == pool_name and not job.claims_blocked]
         pending = 0
         leased = 0
         for job in pool_jobs:
@@ -531,7 +537,7 @@ def run_scheduler(
                 complete = all(
                     partition["status"] in {"merged", "partial"}
                     for job in state["jobs"]
-                    if not job.get("stopped", False)
+                    if not job.get("stopped", False) and job.get("setup_status") != "paused"
                     for partition in job["partitions"].values()
                 )
                 alive = any(

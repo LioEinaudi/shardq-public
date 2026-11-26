@@ -18,6 +18,7 @@ DEFAULT_SHARD = {
 }
 DEFAULT_RETRY = {
     "max_errors": 3,
+    "max_session_errors": 3,
     "max_preemptions": 20,
     "backoff_seconds": 300,
     "bisect": True,
@@ -165,7 +166,7 @@ def load_job_spec(path: Path) -> JobSpec:
         isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0
     ):
         raise ValueError("shard.limit_units must be null or a positive integer")
-    for key in ("max_errors", "max_preemptions", "lease_ttl_seconds"):
+    for key in ("max_errors", "max_session_errors", "max_preemptions", "lease_ttl_seconds"):
         _positive_int(retry, key)
     if (
         isinstance(retry.get("backoff_seconds"), bool)

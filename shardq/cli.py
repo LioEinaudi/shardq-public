@@ -517,14 +517,11 @@ def main(argv: List[str] = None) -> int:
             return 0
 
         if args.command in {"stop", "resume"}:
-            path = Ledger(_root(args.root)).job_dir(args.job) / "STOP"
+            ledger = Ledger(_root(args.root))
             if args.command == "stop":
-                atomic_write_text(path, f"stopped_unix={time.time()}\n")
+                atomic_write_text(ledger.job_dir(args.job) / "STOP", f"stopped_unix={time.time()}\n")
             else:
-                try:
-                    path.unlink()
-                except FileNotFoundError:
-                    pass
+                ledger.resume(args.job)
             print(
                 json.dumps(
                     {

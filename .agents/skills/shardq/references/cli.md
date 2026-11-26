@@ -40,7 +40,8 @@ then `$SHARDQ_POOLS`, then `<root>/pools.json`, else error. Any `ValueError`,
   A merge never blocks the tick; a failed merge is retried after 600 s and listed in
   `warnings`. `state.json` lists `merges_in_flight`.
 - Submission count per pool is `min(demand - live, pool.max_workers - live,
-  --max-submits-per-tick)`, where demand = pending + backoff + leased shards and live
+  --max-submits-per-tick)`, where demand = pending + backoff + leased shards of
+  jobs eligible for claims, and live
   counts queued plus running workers. Uncut units are never counted. Submissions run
   concurrently with up to 4 threads, with successful workers recorded in submission order.
   Volc `capacity_mode: probe` additionally caps queued workers at `volc.max_queued`;
@@ -60,8 +61,9 @@ then `$SHARDQ_POOLS`, then `<root>/pools.json`, else error. Any `ValueError`,
   (including startup failures and `KeyboardInterrupt`) appear only on stderr, so
   preserve stderr when starting the scheduler.
 - `--once` runs one tick and exits 0. `--exit-when-idle` exits 0 once every partition of
-  unstopped jobs is merged or partial, no non-terminal worker or lease remains, and
-  background merges have finished. Stopped jobs are left unfinished and require a
+  jobs outside manual STOP or setup pause is merged or partial, no non-terminal
+  worker or physical lease remains, and background merges have finished. Temporary
+  setup backoff keeps the scheduler waiting. Paused jobs require a
   scheduler restart when resumed after exit. Without this flag the scheduler keeps polling.
   Under tmux, persist stdout/stderr to files and use `remain-on-exit off` so
   exits close the window; `remain-on-exit on` retains even successfully completed panes.
@@ -113,8 +115,10 @@ then `$SHARDQ_POOLS`, then `<root>/pools.json`, else error. Any `ValueError`,
 
 ## stop --job JOB and resume --job JOB
 
-- `stop` writes `jobs/<job>/STOP`; `resume` removes it. A stopped job is neither claimed
-  nor cut. Running attempts finish normally; workers with nothing to claim idle out.
+- `stop` writes `jobs/<job>/STOP`. `resume` starts a fresh setup budget and clears
+  STOP. It also releases setup backoff or pause. Existing failures stay available
+  for audit and range/preemption budgets retain their counts. Running attempts
+  finish normally and workers with nothing to claim idle out.
 
 ## publish --job JOB --out-dir DIR
 

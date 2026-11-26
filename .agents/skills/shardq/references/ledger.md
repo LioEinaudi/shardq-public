@@ -14,6 +14,7 @@ workers/<worker_id>.log                        local launcher stdout/stderr
 workers/<worker_id>.yaml                       Volc task YAML as submitted
 jobs/<job>/job.json                            spec + pins + pool_snapshot + session_key + column
 jobs/<job>/STOP                                present while the job is stopped
+jobs/<job>/setup_epoch.json                    resume generation (missing = initial cycle)
 jobs/<job>/partitions/<p>/partition.json       size, source_size, next_cut, unit_seconds_est, status
 jobs/<job>/partitions/<p>/shards/<shard>/shard.json        start, count, depth, est_seconds
 jobs/<job>/partitions/<p>/shards/<shard>/lease/owner.json  worker_id, handle, attempt
@@ -37,7 +38,7 @@ directory name.
 2. any `attempts/*/complete.json`: DONE.
 3. `quarantine.json` present: QUARANTINED (terminal data gap).
 4. A lease entry gives LEASED.
-5. Otherwise the newest failure's `retry_after_unix` decides PENDING_BACKOFF or PENDING.
+5. Otherwise the newest range failure's `retry_after_unix` decides PENDING_BACKOFF or PENDING.
 
 Under a permanent shard-level `lease.lock`, claim initializes the live owner
 and heartbeat in the private shard directory `.lease-owner/`. It publishes
@@ -58,7 +59,7 @@ per shard, breaking timestamp ties by attempt ID.
 | `launcher_terminal` | reserved in `FAILURE_REASONS`; no code path writes it yet | max_preemptions |
 | `backend_error` | worker when `run_range` raises or the command fails | max_errors |
 | `validation_error` | worker when records do not cover the range | max_errors |
-| `session_error` | worker when `open_session` fails (model load, import) | max_errors |
+| `session_error` | worker during backend or session setup, e.g. model load | job-wide max_session_errors |
 
 `failed.json` holds `attempt_id`, `worker_id`, `handle`, `reason`, `retryable`, `error`
 (last 4000 characters of the traceback or stderr), `failed_unix`, `retry_after_unix`.
@@ -94,8 +95,10 @@ A shard keeps failing
 Preemption reasons are expected on idle queues and only bisect after `max_preemptions`.
 A repeating `backend_error` or `validation_error` on the same units is a poison unit or
 an adapter bug; check `attempts/<a>/raw/` and the worker log. A `session_error` on
-every attempt means the environment inside the worker is broken (imports, weights,
-GPU); fix the entry script or hook, the retry budget will otherwise quarantine everything.
+every attempt suggests a setup failure (imports, weights, GPU). Inspect
+`setup_status`, `session_errors` and `session_retry_after_unix` in `status --job J --json`.
+Repair the environment, then `shardq resume --job J`. A scheduler that already
+exited with `--exit-when-idle` needs restarting.
 
 Partition finished as `partial`
 : `merged/<p>/merge.json` lists `missing_units` and `quarantined_shards`. Quarantine is
