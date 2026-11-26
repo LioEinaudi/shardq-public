@@ -81,6 +81,22 @@ class _SubmitStubLauncher:
 
 
 class RefreshWorkersTest(unittest.TestCase):
+    def test_equal_handles_in_two_pools_preserve_both_workers(self) -> None:
+        other = _pool("other")
+        path = self.root / "workers" / "other-worker.json"
+        atomic_write_json(path, {"worker_id": "other-worker", "pool": "other", "launcher": "local",
+                                 "handle": "local:1", "last_status": "running"})
+        other_stub = _StubLauncher({"local:1": "terminal:0"}, set())
+        key = (str(self.root), "local", other.name)
+        controller._LAUNCHERS[key] = other_stub
+        self.addCleanup(controller._LAUNCHERS.pop, key)
+        rows = controller._refresh_workers(self.root, "local", {**self.pools, "other": other}, time.time())
+        states = {r["worker_id"]: r["last_status"] for r in rows.values()}
+        self.assertEqual(states.get("w-run"), "running")
+        self.assertEqual(states.get("other-worker"), "terminal:0")
+        self.assertTrue(controller._owner_alive(rows, self.pool.name, {"worker_id": "w-run", "handle": ""}))
+        self.assertFalse(controller._owner_alive(rows, "other", {"handle": "local:1"}))
+
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name).resolve()
@@ -117,16 +133,16 @@ class RefreshWorkersTest(unittest.TestCase):
         now = time.time()
         workers = controller._refresh_workers(self.root, "local", self.pools, now)
         self.assertEqual(sorted(self.stub.calls), ["local:1", "local:2", "local:3"])
-        self.assertEqual(set(workers), {"local:9", "local:1", "local:2", "local:3"})
+        self.assertEqual(set(workers), {"w-dead", "w-run", "w-exit", "w-err"})
 
         dead = read_json(self.root / "workers" / "w-dead.json")
         self.assertEqual(dead["last_checked_unix"], self.old)
-        self.assertEqual(workers["local:9"]["last_status"], "terminal:Success")
+        self.assertEqual(workers["w-dead"]["last_status"], "terminal:Success")
 
-        self.assertEqual(workers["local:1"]["last_status"], "running")
-        self.assertFalse(workers["local:1"]["dead"])
-        self.assertEqual(workers["local:2"]["last_status"], "terminal:0")
-        self.assertTrue(workers["local:2"]["dead"])
+        self.assertEqual(workers["w-run"]["last_status"], "running")
+        self.assertFalse(workers["w-run"]["dead"])
+        self.assertEqual(workers["w-exit"]["last_status"], "terminal:0")
+        self.assertTrue(workers["w-exit"]["dead"])
         for worker_id in ("w-run", "w-exit", "w-err"):
             self.assertEqual(
                 read_json(self.root / "workers" / f"{worker_id}.json")["last_checked_unix"],
@@ -135,7 +151,7 @@ class RefreshWorkersTest(unittest.TestCase):
 
     def test_status_error_keeps_previous_status(self) -> None:
         workers = controller._refresh_workers(self.root, "local", self.pools, time.time())
-        row = workers["local:3"]
+        row = workers["w-err"]
         self.assertEqual(row["last_status"], "running")
         self.assertFalse(row["dead"])
         self.assertIn("cli exploded", row["status_error"])

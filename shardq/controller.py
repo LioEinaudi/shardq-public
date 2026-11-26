@@ -82,7 +82,7 @@ def _refresh_workers(root: Path, launcher_name: str, pools: Dict[str, PoolSpec],
         if row.get("dead") and str(row.get("last_status", "")).startswith("terminal:"):
             # Terminal launcher states are final: keep the recorded row and skip the
             # launcher call so tick time does not grow with worker history.
-            workers[handle] = row
+            workers[row["worker_id"]] = row
             continue
         launcher = _launcher(root, launcher_name, pools[pool_name])
         pending.append((path, row, handle, launcher))
@@ -99,13 +99,22 @@ def _refresh_workers(root: Path, launcher_name: str, pools: Dict[str, PoolSpec],
         row["dead"] = status.startswith("terminal:")
         row["last_checked_unix"] = now
         atomic_write_json(path, row)
-        return handle, row
+        return row
 
     if pending:
         with ThreadPoolExecutor(max_workers=min(STATUS_THREADS, len(pending))) as executor:
-            for handle, row in executor.map(refresh, pending):
-                workers[handle] = row
+            for row in executor.map(refresh, pending):
+                workers[row["worker_id"]] = row
     return workers
+
+
+def _owner_alive(workers: dict, pool: str, owner: dict) -> bool:
+    worker = workers.get(owner.get("worker_id"))
+    if worker is None and owner.get("handle"):
+        # Legacy leases may only carry a launcher handle.
+        worker = next((row for row in workers.values()
+                       if row.get("pool") == pool and row.get("handle") == owner["handle"]), None)
+    return bool(worker and worker.get("pool") == pool and worker.get("last_status") in {"queued", "running"})
 
 
 def _merge_executor(opts: dict) -> ThreadPoolExecutor:
@@ -238,14 +247,10 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
         if str(read_json(ledger.job_dir(job_id) / "job.json", {}).get("pool")) in relevant_pool_names
     ]
 
-    def alive(owner: dict) -> bool:
-        status = str((workers.get(str(owner.get("handle"))) or {}).get("last_status", "unknown"))
-        return status in {"running", "queued"}
-
     for job_id in job_ids:
         job = ledger.scan_job(job_id, now)
         ttl = int((job.spec.get("retry") or {}).get("lease_ttl_seconds", 900))
-        for shard_id in ledger.expire_leases(job_id, ttl, alive, now):
+        for shard_id in ledger.expire_leases(job_id, ttl, lambda owner: _owner_alive(workers, job.pool, owner), now):
             actions.append({"action": "expire", "job_id": job_id, "shard_id": shard_id})
 
     for job_id in job_ids:
@@ -432,7 +437,7 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
                         "gpu_slots": gpu_slots,
                     }
                     atomic_write_json(root / "workers" / f"{worker_id}.json", row)
-                    workers[handle] = row
+                    workers[row["worker_id"]] = row
                     actions.append({"action": "submit", "pool": pool_name, "worker_id": worker_id, "handle": handle})
 
     final_jobs = [ledger.scan_job(job_id, now) for job_id in job_ids]
