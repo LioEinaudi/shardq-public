@@ -29,6 +29,7 @@ from .spec import (
     resolve_root,
 )
 from .status import render_status
+from .submission_admin import resolve_submission
 from .worker import _pool_from_ledger, default_worker_id, run_worker
 
 
@@ -372,6 +373,17 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--job")
     status.add_argument("--json", action="store_true")
 
+    resolve = commands.add_parser("resolve-submission", help="record a verified provider outcome with the scheduler stopped")
+    _add_config_args(resolve)
+    resolve.add_argument("--worker-id", required=True)
+    outcome = resolve.add_mutually_exclusive_group(required=True)
+    outcome.add_argument("--handle", help="bind a verified handle after verifying all other matches are inactive")
+    outcome.add_argument("--not-created", action="store_true", help="record provider evidence that no task was created")
+    outcome.add_argument("--terminal", action="store_true", help="record that all possible matching tasks are terminal")
+    resolve.add_argument("--terminal-match", action="append", default=[], metavar="HANDLE",
+                         help="with --handle, list each other match verified terminal (repeatable)")
+    resolve.add_argument("--evidence", required=True, help="provider evidence supporting this decision")
+
     merge = commands.add_parser("merge")
     merge.add_argument("--job", required=True)
     _add_config_args(merge)
@@ -479,6 +491,13 @@ def main(argv: List[str] = None) -> int:
 
         if args.command == "status":
             print(render_status(_root(args.root), args.job, args.json), end="")
+            return 0
+
+        if args.command == "resolve-submission":
+            action = "bind" if args.handle is not None else ("not-created" if args.not_created else "terminal")
+            row = resolve_submission(_root(args.root), args.worker_id, action, args.evidence,
+                                     args.handle, args.terminal_match)
+            print(json.dumps(row, ensure_ascii=False))
             return 0
 
         if args.command == "merge":
