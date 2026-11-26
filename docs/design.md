@@ -222,10 +222,18 @@ and external configuration stable across submit and recovery. The digest
 identifies the configured request. It does not pin remote image contents or
 discover changes to a CLI's implicit credentials.
 
-**Capacity.** An intent or unresolved call holds a worker slot, a potential
-queued position when `max_queued` applies, and its requested GPU slots. A
-multiple-match conflict holds one reservation per known distinct match.
-Reusing an uncalled intent consumes its existing reservation first. An
+**Capacity.** An intent or unresolved call holds a worker slot and a potential
+queued position when `max_queued` applies. The row records its requested GPUs.
+After a restart, Volc audit pools with uncalled intents get the first turns,
+in pool-name order. Each may dispatch only its existing intents on that turn,
+subject to current demand, worker and queue limits, and a fresh GPU audit.
+Uncalled intents in these pools can wait for a later turn. A reduced shared
+quota therefore lets one eligible request take the available GPUs. Each pool
+finishes its batch before the next pool audits capacity. A pending intent in
+a probe pool still counts against a matching audit budget because that pool
+can dispatch without a GPU audit.
+
+A multiple-match conflict holds one reservation per known distinct match. An
 unresolved request stays charged to the original Volc queue/creator during
 GPU admission, even across ShardQ pools or a change of configuration. An audit
 may already include an unbound task. The extra deduction can temporarily

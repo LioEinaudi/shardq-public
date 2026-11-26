@@ -220,7 +220,7 @@ def _write_status(root: Path, state: dict) -> None:
     atomic_write_text(path, "\n".join(lines) + "\n")
 
 
-def _submit_workers(root, pool, pools_path, demand, workers, backoff, max_submits,
+def _submit_workers(root, pool, pools_path, demand, workers, audit_waiters, backoff, max_submits,
                     actions, warnings, now):
     rows = [row for row in workers.values() if row["pool"] == pool.name]
     intents = [row for row in rows if row.get("submission_state") == "intent"]
@@ -236,6 +236,10 @@ def _submit_workers(root, pool, pools_path, demand, workers, backoff, max_submit
         return
 
     count = min(wanted, max_submits)
+    if pool.name in audit_waiters:
+        # Use this turn for recovered requests. Other waiting pools get their
+        # turn before this pool can replenish with a fresh identity.
+        count = min(count, len(intents))
     block = _launcher_block(pool, pool.launcher)
     gpu = int(block.get("gpu_slots", 1))
     try:
@@ -254,12 +258,15 @@ def _submit_workers(root, pool, pools_path, demand, workers, backoff, max_submit
             state = row.get("submission_state")
             if state not in submission.UNRESOLVED and state != "intent":
                 continue
-            if row["pool"] == pool.name:
-                if state == "intent":  # this batch can consume its own reservations
-                    continue
-            elif not (pool.launcher == row["launcher"] == "volc"
-                      and row.get("resource_queue") == block.get("queue")
-                      and row.get("resource_creator") in {None, block.get("creator")}):
+            if state == "intent" and (row["pool"] == pool.name or row["pool"] in audit_waiters):
+                # A saved audit intent must win a fresh capacity check before
+                # dispatch. Charging it here could make two such intents deadlock.
+                continue
+            if row["pool"] != pool.name and not (
+                pool.launcher == row["launcher"] == "volc"
+                and row.get("resource_queue") == block.get("queue")
+                and row.get("resource_creator") in {None, block.get("creator")}
+            ):
                 continue
             reserved += submission.occupies(row) * row.get("gpu_slots", gpu)
         count = min(count, max(0, slots - reserved) // gpu)
@@ -417,12 +424,19 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
     backoff = opts.setdefault("_pool_backoff", {})
     current_jobs = [ledger.scan_job(job_id, now) for job_id in job_ids]
     max_submits = int(opts.get("max_submits_per_tick", 4))
-    for pool_name in sorted(relevant_pool_names):
+    audit_waiters = {
+        row["pool"] for row in workers.values()
+        if row.get("submission_state") == "intent" and row["pool"] in relevant_pool_names
+        and launcher_name == "volc" and pools[row["pool"]].volc.get("capacity_mode") == "audit"
+    }
+    # The root lock serializes pools. Each pool finishes its batch before the
+    # next one queries the provider and accounts for unresolved ledger rows.
+    for pool_name in sorted(relevant_pool_names, key=lambda name: (name not in audit_waiters, name)):
         pool = pools[pool_name]
         demand = sum(part.pending + part.backoff + part.leased
                      for job in current_jobs if job.pool == pool_name and not job.claims_blocked
                      for part in job.partitions.values())
-        _submit_workers(root, pool, pools_path, demand, workers, backoff, max_submits,
+        _submit_workers(root, pool, pools_path, demand, workers, audit_waiters, backoff, max_submits,
                         actions, warnings, now)
 
     final_jobs = [ledger.scan_job(job_id, now) for job_id in job_ids]

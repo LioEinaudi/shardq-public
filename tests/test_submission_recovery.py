@@ -1,5 +1,6 @@
 """Process-exit tests for the scheduler's durable worker submission protocol."""
 
+import json
 import multiprocessing
 import os
 import subprocess
@@ -23,7 +24,8 @@ class Platform(Launcher):
     """Each accepted call creates a separate task, even for a repeated request ID."""
 
     def __init__(self, directory, pool, scenario, batch):
-        self.directory = directory / pool
+        self.directory = directory / pool.name
+        self.pool = pool
         self.directory.mkdir(exist_ok=True)
         self.scenario = scenario
         self.batch = batch
@@ -40,6 +42,8 @@ class Platform(Launcher):
         handle = uuid4().hex
         atomic_write_json(self.directory / (handle + ".json"), {
             "worker_id": worker_id, "handle": handle, "status": "running",
+            "queue": self.pool.volc.get("queue"), "creator": self.pool.volc.get("creator"),
+            "gpu_slots": self.pool.volc.get("gpu_slots", 1),
         })
         if self.scenario == "accepted-crash":
             os._exit(CRASHED)
@@ -75,7 +79,15 @@ class Platform(Launcher):
         if self.scenario == "quota-unavailable" and self.directory.name == "p":
             raise subprocess.TimeoutExpired(["quota"], 1)
         quota = self.directory / "available-slots"
-        return int(quota.read_text()) if quota.exists() else None
+        if quota.exists():
+            return int(quota.read_text())
+        config = self.pool.volc
+        if config.get("capacity_mode") == "audit":
+            tasks = (read_json(path) for path in self.directory.parent.glob("*/*.json"))
+            used = sum(task["gpu_slots"] for task in tasks if not task["status"].startswith("terminal:")
+                       and (task["queue"], task["creator"]) == (config["queue"], config["creator"]))
+            return max(0, config["gpu_cap"] - used)
+        return None
 
     def kill(self, handle):
         raise AssertionError("recovery tried to remove a platform task")
@@ -100,7 +112,7 @@ def scheduler_process(root, service, now, scenario, launcher_name, until_idle, b
         replace(src, dst)
 
     def launcher(root, provider, pool):
-        return Platform(service, pool.name, scenario, batch)
+        return Platform(service, pool, scenario, batch)
 
     with patch.object(controller, "_launcher", launcher), patch.object(os, "replace", publish), \
             patch("time.time", return_value=now), patch("time.sleep", side_effect=lambda _: os._exit(KEPT_POLLING)):
@@ -367,6 +379,104 @@ class SubmissionRecoveryTests(unittest.TestCase):
         self.run_tick(100, "quota-unavailable")
         self.assertEqual(list((self.service / "p").glob("*.json")), [])
         self.assertEqual(len(list((self.service / "q").glob("*.json"))), 1)
+
+    def shared_intents(self):
+        audit = {"capacity_mode": "audit", "gpu_slots": 1, "gpu_cap": 2,
+                 "max_queued": 1, "queue": "research", "creator": "tester"}
+        self.configure_pool(launcher="volc", max_workers=1, volc=audit)
+        self.run_tick(100, "all-intents-ready", CRASHED)
+        self.job("second", pool="q")
+        self.set_shared_cap(2, p_max_queued=0)
+        self.run_tick(200, "all-intents-ready", CRASHED)
+        self.assertEqual(self.tasks(), [])
+        rows = {row["pool"]: row for row in self.rows()}
+        self.assertEqual({name: r["submission_state"] for name, r in rows.items()},
+                         {"p": "intent", "q": "intent"})
+        self.set_shared_cap(1)
+        return rows
+
+    def set_shared_cap(self, cap, p_max_queued=1):
+        block = dict(self.pool["volc"], gpu_cap=cap)
+        atomic_write_json(self.root / "pools.json", {"pools": {
+            "p": dict(self.pool, volc=dict(block, max_queued=p_max_queued)),
+            "q": dict(self.pool, volc=block),
+        }})
+
+    def test_shared_gpu_cap_shrink_dispatches_both_original_intents_in_turn(self):
+        original = self.shared_intents()
+        for now in (300, 400, 500):
+            self.run_tick(now)
+        tasks = self.tasks()
+        self.assertEqual(len(tasks), 1, "three scheduler restarts with one free GPU")
+        first, = tasks
+        winner = next(name for name in original if original[name]["request_id"] == first["worker_id"])
+        other = (original.keys() - {winner}).pop()
+        self.assertEqual(first["gpu_slots"], 1)
+        first["status"] = "terminal:success"
+        atomic_write_json(self.service / winner / (first["handle"] + ".json"), first)
+        for now in (600, 700):
+            self.run_tick(now)
+        tasks = self.tasks()
+        self.assertEqual(len(tasks), 2)
+        active = [task for task in tasks if task["status"] == "running"]
+        self.assertEqual([(t["worker_id"], t["gpu_slots"]) for t in active],
+                         [(original[other]["request_id"], 1)])
+        self.assertEqual({(r["worker_id"], r["request_id"], r["request_fingerprint"]) for r in self.rows()},
+                         {(r["worker_id"], r["request_id"], r["request_fingerprint"]) for r in original.values()})
+
+    def test_queue_blocked_saved_intent_yields_to_runnable_pool(self):
+        original = self.shared_intents()
+        self.set_shared_cap(1, p_max_queued=0)
+        self.run_tick(300)
+        task, = self.tasks()
+        self.assertEqual(task["worker_id"], original["q"]["worker_id"])
+        self.assertEqual({r["pool"]: r["submission_state"] for r in self.rows()},
+                         {"p": "intent", "q": "confirmed"})
+
+    def test_range_completions_withdraw_excess_uncalled_intents(self):
+        self.configure_pool(launcher="volc", max_workers=3, volc={
+            "capacity_mode": "audit", "gpu_cap": 3, "gpu_slots": 1, "max_queued": 3,
+            "queue": "research", "creator": "tester",
+        })
+        self.run_tick(100, "all-intents-ready", CRASHED)
+        original_ids = {r["worker_id"] for r in self.rows()}
+        self.assertEqual(len(original_ids), 3)
+        ledger = Ledger(self.root)
+        for i in range(5):  # Another worker finishes five of the six pending ranges.
+            claim = ledger.claim("p", ["job"], {"worker_id": "direct"}, None, None, 110 + i)
+            records = claim.attempt_dir / "records.jsonl"
+            records.write_text(json.dumps({"unit_id": claim.start}) + "\n")
+            ledger.complete(claim, records, claim.count, 110 + i, 1, {}, 111 + i)
+        self.run_tick(300)
+        self.assertEqual(sorted(r["last_status"] for r in self.rows()),
+                         ["queued", "terminal:withdrawn-before-submit", "terminal:withdrawn-before-submit"])
+        task, = self.tasks()
+        self.assertIn(task["worker_id"], original_ids)
+
+    def test_shared_gpu_ambiguous_calls_keep_reservations_ahead_of_intents(self):
+        original = self.shared_intents()
+        self.run_tick(300, "exit-before-create", CRASHED)
+        rows = {r["submission_state"]: r for r in self.rows()}
+        entered = rows["submitting"]
+        self.assertEqual(entered["worker_id"], original[entered["pool"]]["request_id"])
+        self.assertEqual(self.tasks(), [])
+        for now in (400, 800):
+            self.run_tick(now)
+            self.assertEqual(self.tasks(), [], "a zero-match call still owns the GPU")
+            self.assertEqual(sorted(r["submission_state"] for r in self.rows()), ["intent", "uncertain"])
+        # Two distinct matches in a complete lookup. Even terminal-looking
+        # matches require resolution, so the audit now reports two free slots.
+        for handle in ("one", "two"):
+            atomic_write_json(self.service / entered["pool"] / (handle + ".json"), {
+                "handle": handle, "worker_id": entered["worker_id"], "status": "terminal:done",
+                "queue": "research", "creator": "tester", "gpu_slots": 1,
+            })
+        self.set_shared_cap(2)
+        for now in (1200, 1600):
+            self.run_tick(now)
+            self.assertEqual({t["worker_id"] for t in self.tasks()}, {entered["worker_id"]})
+            self.assertEqual(sorted(r["submission_state"] for r in self.rows()), ["conflict", "intent"])
+            self.assertEqual(len(self.tasks()), 2)
 
     def test_dispatch_detects_changed_request_before_platform_call(self):
         self.run_tick(100, "template-changed")
