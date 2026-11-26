@@ -52,6 +52,9 @@ class _StubLauncher:
 
 
 class _SubmitStubLauncher:
+    def submission_inputs(self):
+        return {}
+
     def __init__(self) -> None:
         self.calls = []
         self.handles = set()
@@ -246,15 +249,14 @@ class CutAndSubmitTest(unittest.TestCase):
             [f"{self.pool.name}: submit failed: RuntimeError: submit exploded"],
         )
         rows = [read_json(path) for path in (self.root / "workers").glob("*.json")]
-        self.assertEqual(len(rows), 2)
-        self.assertEqual({row["handle"] for row in rows}, {"local:1", "local:3"})
+        self.assertEqual(len(rows), 3)
+        confirmed = [row for row in rows if row["submission_state"] == "confirmed"]
+        self.assertEqual({row["handle"] for row in confirmed}, {"local:1", "local:3"})
+        self.assertEqual(sum(row["submission_state"] == "uncertain" for row in rows), 1)
         self.assertEqual(state["workers_submitted"], 2)
         submissions = [action for action in state["actions"] if action["action"] == "submit"]
         self.assertEqual(len(submissions), 2)
-        self.assertEqual(
-            [action["worker_id"] for action in submissions],
-            sorted(row["worker_id"] for row in rows),
-        )
+        self.assertEqual({action["worker_id"] for action in submissions}, {row["worker_id"] for row in confirmed})
 
     def test_throttled_submit_does_not_backoff(self) -> None:
         self._configure_shards(lookahead=3)
@@ -267,8 +269,10 @@ class CutAndSubmitTest(unittest.TestCase):
         self.assertLessEqual(state["pool_backoff"].get(self.pool.name, 0), now)
         self.assertEqual(state["warnings"], [f"{self.pool.name}: submit throttled: flow control"])
         rows = [read_json(path) for path in (self.root / "workers").glob("*.json")]
-        self.assertEqual(len(rows), 2)
-        self.assertEqual({row["handle"] for row in rows}, {"local:1", "local:3"})
+        self.assertEqual(len(rows), 3)
+        self.assertEqual({row["handle"] for row in rows if row["submission_state"] == "confirmed"},
+                         {"local:1", "local:3"})
+        rejected, = [row for row in rows if row["submission_state"] == "rejected"]
         self.assertEqual(state["workers_submitted"], 2)
         self.assertEqual(len(logs.records), 1)
         self.assertEqual(logs.records[0].levelname, "WARNING")
@@ -277,6 +281,7 @@ class CutAndSubmitTest(unittest.TestCase):
 
         state = controller.tick(self.root, "local", self.pools, self.opts, now + 1)
         self.assertEqual(len(self.stub.calls), 4)
+        self.assertEqual(self.stub.calls[-1][0], rejected["request_id"])
         self.assertEqual(state["workers_submitted"], 1)
 
 
