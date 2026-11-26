@@ -54,7 +54,7 @@ def _last_failure_reason(shard_dir: Path) -> str:
     failures = []
     for path in (shard_dir / "attempts").glob("*/failed.json"):
         payload = read_json(path, {})
-        if isinstance(payload, dict) and payload.get("reason") != "session_error":
+        if isinstance(payload, dict) and payload.get("reason") not in ("session_error", "worker_restart"):
             failures.append(payload)
     if not failures:
         return "backend_error"
@@ -426,6 +426,13 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
                         actions, warnings, now)
 
     final_jobs = [ledger.scan_job(job_id, now) for job_id in job_ids]
+    for job in final_jobs:
+        if job.setup_status == "backoff":
+            warnings.append(f"{job.job_id} session setup is in backoff after {job.session_errors} failures. "
+                            f"Inspect the session_error attempts. Setup can retry at Unix {job.session_retry_after_unix}.")
+        elif job.setup_status == "paused":
+            warnings.append(f"{job.job_id} session setup is paused after {job.session_errors} failures. "
+                            f"Repair the environment and run shardq resume --job {job.job_id}")
     state = {
         "schema_version": 1,
         "updated_unix": now,
@@ -537,6 +544,11 @@ def run_scheduler(
                     for partition in job["partitions"].values()
                 )
                 if complete and not alive and not leased and not state.get("merges_in_flight"):
-                    LOGGER.info("idle: active jobs finished, workers and merges drained; exiting")
+                    paused = [job["job_id"] for job in state["jobs"] if job.get("setup_status") == "paused"]
+                    if paused:
+                        LOGGER.warning("Exiting idle scheduler with jobs paused after session setup failures (%s)",
+                                       ", ".join(paused))
+                    else:
+                        LOGGER.info("idle: active jobs finished, workers and merges drained; exiting")
                     return 0
             time.sleep(poll_seconds)

@@ -538,7 +538,7 @@ def main(argv: List[str] = None) -> int:
         if args.command in {"stop", "resume"}:
             ledger = Ledger(_root(args.root))
             if args.command == "stop":
-                atomic_write_text(ledger.job_dir(args.job) / "STOP", f"stopped_unix={time.time()}\n")
+                ledger.stop(args.job)
             else:
                 ledger.resume(args.job)
             print(

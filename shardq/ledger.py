@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .fs import atomic_write_json, atomic_write_text as _atomic_write_text, file_lock
-from .spec import slug
+from .spec import JOB_ID_RE, slug
 
 
 FAILURE_REASONS = {
@@ -304,10 +304,22 @@ class Ledger:
             session_retry_after_unix=session_retry_after,
         )
 
-    def resume(self, job_id: str) -> None:
+    def _registered_job_dir(self, job_id: str) -> Path:
+        if not JOB_ID_RE.fullmatch(job_id) or job_id in {".", ".."}:
+            raise ValueError(f"invalid job ID: {job_id!r}")
         directory = self.job_dir(job_id)
+        if directory.is_symlink():
+            raise ValueError(f"job directory is a symbolic link: {job_id!r}")
         if not (directory / "job.json").is_file():
             raise ValueError(f"unknown job: {job_id}")
+        return directory
+
+    def stop(self, job_id: str) -> None:
+        directory = self._registered_job_dir(job_id)
+        _atomic_write_text(directory / "STOP", f"stopped_unix={time.time()}\n")
+
+    def resume(self, job_id: str) -> None:
+        directory = self._registered_job_dir(job_id)
         # A generation rather than a timestamp also fences failures reported
         # after resume by a worker which already held its claim.
         atomic_write_json(directory / "setup_epoch.json", uuid.uuid4().hex)
