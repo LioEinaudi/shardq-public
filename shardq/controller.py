@@ -137,7 +137,7 @@ def _update_history(root: Path, jobs: list, now: float, actions: list) -> None:
         for partition in job.partitions.values():
             key = f"{backend}:{session_key}:{partition.name}"
             partition_dir = root / "jobs" / job.job_id / "partitions" / partition.name
-            partition_paths.setdefault(key, []).append(partition_dir / "partition.json")
+            partition_paths.setdefault(key, []).append((partition_dir / "partition.json", partition.unit_seconds_est))
             for shard in partition.shards:
                 shard_dir = partition_dir / "shards" / shard.shard_id
                 for complete_path in sorted((shard_dir / "attempts").glob("*/complete.json")):
@@ -164,12 +164,9 @@ def _update_history(root: Path, jobs: list, now: float, actions: list) -> None:
             changed = True
             actions.append({"action": "history", "key": key, "attempts": len(rows)})
         estimate = float(rebuilt[key]["unit_seconds"])
-        for metadata_path in partition_paths.get(key, []):
-            metadata = read_json(metadata_path, {})
-            if metadata.get("unit_seconds_est") != estimate:
-                metadata["unit_seconds_est"] = estimate
-                atomic_write_json(metadata_path, metadata)
-                changed = True
+        for metadata_path, previous_estimate in partition_paths.get(key, []):
+            if previous_estimate != estimate:
+                Ledger.update_partition(metadata_path, unit_seconds_est=estimate)
     if changed or not history_path.exists():
         atomic_write_json(history_path, history)
 

@@ -1,13 +1,22 @@
-"""Publication primitives for a cooperating POSIX ledger."""
+"""Publication and locking primitives for a cooperating POSIX ledger."""
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
+
+
+@contextmanager
+def file_lock(path: Path) -> Iterator[None]:
+    """All contenders must open the same permanent inode on a lock-aware mount."""
+    with path.open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
 
 
 @contextmanager

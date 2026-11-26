@@ -53,6 +53,7 @@ The root is always supplied by `--root` or `SHARDQ_ROOT`. Its format is:
 ```text
 jobs/<job>/job.json
 jobs/<job>/partitions/<partition>/partition.json
+jobs/<job>/partitions/<partition>/partition.lock
 jobs/<job>/partitions/<partition>/shards/<shard>/
   shard.json
   lease/{owner.json,heartbeat}
@@ -76,6 +77,8 @@ and do not depend on filesystem mtime.
 Published files use unique temporary names in the destination directory and
 clean them up on ordinary errors. Process death can leave an unpublished
 temporary file.
+The partition lock serializes the full read-modify-write when cutting, updating
+the runtime estimate and publishing merge status.
 
 `read_json` returns its default for ledger files deleted during a read or
 containing incomplete content; the next tick re-derives state so transient

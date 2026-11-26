@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import tempfile
 import threading
@@ -8,7 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from shardq.ledger import atomic_write_json, read_json
+from shardq.controller import _update_history
+from shardq.ledger import Ledger, atomic_write_json, read_json
 
 
 class AtomicMetadataTests(unittest.TestCase):
@@ -36,3 +38,48 @@ class AtomicMetadataTests(unittest.TestCase):
                     atomic_write_json(path, {})
             self.assertEqual(read_json(path), {"old": True})
             self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_history_update_during_merge_keeps_estimate_and_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = Ledger(root)
+            job = ledger.job_dir("j")
+            metadata = job / "partitions" / "p" / "partition.json"
+            atomic_write_json(job / "job.json", {"job_id": "j", "backend": "fake", "pool": "pool"})
+            atomic_write_json(metadata, {
+                "name": "p", "next_cut": 0, "status": "cutting", "size": 1, "unit_seconds_est": 1.0,
+            })
+            shard = ledger.cut("j", "p", 1, 1, 1)
+            attempt = metadata.parent / "shards" / shard / "attempts" / "w"
+            atomic_write_json(attempt / "complete.json", {"count": 1, "elapsed_seconds": 10.0})
+            jobs = [ledger.scan_job("j", 10)]
+
+            # Hold the merge just before it publishes partition.json. Let history
+            # either contend for its lock or finish an unguarded update first.
+            at_merge_publish = threading.Event()
+            history_progress = threading.Event()
+            replace, flock = os.replace, fcntl.flock
+            main = threading.current_thread()
+
+            def interleave(src, dst):
+                if Path(dst) == metadata and threading.current_thread() is not main:
+                    at_merge_publish.set()
+                    self.assertTrue(history_progress.wait(5))
+                replace(src, dst)
+                if Path(dst) == metadata and threading.current_thread() is main:
+                    history_progress.set()
+
+            def track_flock(file, operation):
+                if threading.current_thread() is main and operation & fcntl.LOCK_EX:
+                    history_progress.set()
+                return flock(file, operation)
+
+            with patch.object(os, "replace", interleave), patch.object(fcntl, "flock", track_flock):
+                with ThreadPoolExecutor(1) as pool:
+                    merge = pool.submit(ledger.set_partition_status, "j", "p", "merged")
+                    self.assertTrue(at_merge_publish.wait(5))
+                    _update_history(root, jobs, 10, [])
+                    merge.result(timeout=5)
+            updated = read_json(metadata)
+            self.assertEqual(updated["status"], "merged")
+            self.assertEqual(updated["unit_seconds_est"], 10.0)

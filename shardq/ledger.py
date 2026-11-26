@@ -9,7 +9,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .fs import atomic_write_json, atomic_write_text as _atomic_write_text
+from .fs import atomic_write_json, atomic_write_text as _atomic_write_text, file_lock
 from .spec import slug
 
 
@@ -392,9 +392,16 @@ class Ledger:
         if count <= 0:
             raise ValueError("cut count must be positive")
         partition_dir = self.job_dir(job_id) / "partitions" / partition
+        if not partition_dir.is_dir():
+            raise ValueError(f"unknown partition: {job_id}:{partition}")
+        with file_lock(partition_dir / "partition.lock"):
+            return self._cut_locked(partition_dir, count, est_seconds, now)
+
+    def _cut_locked(self, partition_dir: Path, count: int, est_seconds: float, now: float) -> str:
+        partition = partition_dir.name
         metadata = read_json(partition_dir / "partition.json")
         if not isinstance(metadata, dict):
-            raise ValueError(f"unknown partition: {job_id}:{partition}")
+            raise ValueError(f"missing partition metadata: {partition_dir}")
         start = int(metadata.get("next_cut", 0))
         size = int(metadata["size"])
         if count > size - start:
@@ -521,8 +528,13 @@ class Ledger:
         if status not in PARTITION_STATUSES:
             raise ValueError(f"invalid partition status: {status}")
         path = self.job_dir(job_id) / "partitions" / partition / "partition.json"
-        payload = read_json(path)
-        if not isinstance(payload, dict):
-            raise ValueError(f"unknown partition: {job_id}:{partition}")
-        payload["status"] = status
-        atomic_write_json(path, payload)
+        self.update_partition(path, status=status)
+
+    @staticmethod
+    def update_partition(path: Path, **fields: Any) -> None:
+        with file_lock(path.with_suffix(".lock")):
+            payload = read_json(path)
+            if not isinstance(payload, dict):
+                raise ValueError(f"missing partition metadata: {path}")
+            payload.update(fields)
+            atomic_write_json(path, payload)
