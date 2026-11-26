@@ -69,6 +69,18 @@ A pool chooses a backend and launcher. Backend-specific values belong in
 `extra.column`. See [examples/pools.example.json](examples/pools.example.json)
 for local and placeholder Volc pools.
 
+## Recovery and upgrades
+
+For an existing ledger, stop the old scheduler and drain old workers, including
+queued submissions, before starting the upgraded writers. Existing pools,
+snapshots, jobs and attempts can be used in place.
+
+Use a POSIX shared filesystem with coherent cross-host `flock`, symbolic links
+and atomic same-directory file rename. A worker publishes a fully initialized
+lease with one link creation. The scheduler can also recover incomplete leases
+left by earlier versions after a two-TTL grace period. The deployment assumptions
+and recovery rules are in [the design](docs/design.md#ledger-and-state-semantics).
+
 ## Volc
 
 The package includes its Volc CLI client and a packaged YAML template. A Volc

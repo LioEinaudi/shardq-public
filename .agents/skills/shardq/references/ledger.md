@@ -17,7 +17,7 @@ jobs/<job>/STOP                                present while the job is stopped
 jobs/<job>/partitions/<p>/partition.json       size, source_size, next_cut, unit_seconds_est, status
 jobs/<job>/partitions/<p>/shards/<shard>/shard.json        start, count, depth, est_seconds
 jobs/<job>/partitions/<p>/shards/<shard>/lease/owner.json  worker_id, handle, attempt
-jobs/<job>/partitions/<p>/shards/<shard>/lease/heartbeat   unix seconds, rewritten every 60 s
+jobs/<job>/partitions/<p>/shards/<shard>/lease/heartbeat   unix seconds, interval at most half TTL
 jobs/<job>/partitions/<p>/shards/<shard>/attempts/<a>/records.jsonl
 jobs/<job>/partitions/<p>/shards/<shard>/attempts/<a>/raw/            backend raw output
 jobs/<job>/partitions/<p>/shards/<shard>/attempts/<a>/complete.json | failed.json
@@ -36,12 +36,18 @@ directory name.
 1. `superseded.json` present: SUPERSEDED (children carry the work).
 2. any `attempts/*/complete.json`: DONE.
 3. `quarantine.json` present: QUARANTINED (terminal data gap).
-4. `lease/` directory present: LEASED.
-5. otherwise, the newest `failed.json` `retry_after_unix` decides PENDING_BACKOFF or PENDING.
+4. A lease entry gives LEASED.
+5. Otherwise the newest failure's `retry_after_unix` decides PENDING_BACKOFF or PENDING.
 
-A claim is `os.mkdir(lease)`; the loser gets `FileExistsError`. Heartbeat content is the
-unix time, not the file mtime. Records in an attempt are only trusted after
-`complete.json` exists; merge picks, per unit, the earliest completed attempt.
+Under a permanent shard-level `lease.lock`, claim initializes the live owner
+and heartbeat in the private shard directory `.lease-owner/`. It publishes
+`lease -> .lease-owner` with one symlink creation. The attempt holds an audit
+copy of the owner. All lease writers take the same lock to verify ownership.
+New code can recover old directory leases. An invalid or missing owner gets two
+TTLs of grace from the most recent directory-entry or owner modification. Such a
+recovery consumes no retry budget. Keep all lock files and attempt directories.
+Merge accepts valid late completions and chooses the earliest completed attempt
+per shard, breaking timestamp ties by attempt ID.
 
 ## Failure reasons
 

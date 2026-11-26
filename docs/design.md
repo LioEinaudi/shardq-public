@@ -56,8 +56,10 @@ jobs/<job>/partitions/<partition>/partition.json
 jobs/<job>/partitions/<partition>/partition.lock
 jobs/<job>/partitions/<partition>/shards/<shard>/
   shard.json
-  lease/{owner.json,heartbeat}
-  attempts/<attempt>/{records.jsonl,raw/,complete.json|failed.json}
+  lease.lock
+  lease -> .lease-owner
+  .lease-owner/{owner.json,heartbeat}
+  attempts/<attempt>/{owner.json,records.jsonl,raw/,complete.json,failed.json}
   quarantine.json
   superseded.json
 jobs/<job>/merged/<partition>/{results.json,records.jsonl,merge.json}
@@ -67,18 +69,54 @@ scheduler/{lock,state.json,status.md,log/scheduler.log}
 history.json
 ```
 
-A shard's state is derived in this strict order:
-`superseded.json -> SUPERSEDED`; any `complete.json -> DONE`;
-`quarantine.json -> QUARANTINED`; `lease/ -> LEASED`; otherwise the newest
-failure's `retry_after_unix` selects `PENDING_BACKOFF` or `PENDING`.
-`lease/` is acquired with atomic `os.mkdir`. Heartbeats contain Unix seconds
-and do not depend on filesystem mtime.
+A shard's state follows the first matching condition in this order.
 
-Published files use unique temporary names in the destination directory and
-clean them up on ordinary errors. Process death can leave an unpublished
-temporary file.
-The partition lock serializes the full read-modify-write when cutting, updating
-the runtime estimate and publishing merge status.
+1. A superseded marker gives `SUPERSEDED`.
+2. A completed attempt gives `DONE`.
+3. A quarantine marker gives `QUARANTINED`.
+4. A current lease entry gives `LEASED`.
+5. The newest failure's retry time selects `PENDING_BACKOFF` or `PENDING`.
+
+**Lease publication and release.** Each writer opens the shard's permanent
+`lease.lock` file and takes an exclusive `flock` for the mutation. Claim checks
+the shard again under the lock and creates a fresh attempt directory with an
+audit copy of the owner. While there is no current lease, it prepares the live
+owner and initial Unix heartbeat under the private shard directory
+`.lease-owner/`. A backend may write its own `heartbeat` file in its attempt
+output directory. Successful creation of the relative symlink
+`lease -> .lease-owner` is the claim's linearization point. An existing
+destination makes creation fail. A crash before publication can leave an unused
+attempt directory and staging files. The next claimant initializes the private
+files under the same lock before publishing its own generation.
+
+Heartbeats verify the attempt ID under that same lock and atomically replace
+the heartbeat file. For release, the identity check and unlink occur within
+one lock acquisition. Expiry checks launcher liveness outside the lock and
+rechecks the owner and heartbeat under it. Locks have stable inodes across
+lease generations and are released by closing the file descriptor or process
+exit. Legacy physical lease directories use the same lock for removal. An
+unreadable or invalid owner gets a grace period of two TTLs from the latest
+lease-entry or owner-file modification. Recovery of an unidentified lease
+leaves sample and preemption budgets intact.
+
+Completion publishes the attempt's marker even when its lease has expired.
+Only the current generation can release its lease. Merge chooses the minimum
+`(completed_unix, attempt_id)` per eligible shard and verifies the records'
+SHA-256. A late completion can mark a shard DONE while a replacement still
+holds its lease. Expiry and scheduler drain include that physical lease.
+
+**Filesystem contract.** All writers need mutually visible POSIX namespace
+operations, cross-client exclusive `flock` on the same inode, atomic symlink
+creation/unlink and same-directory file rename, plus clocks suitable for the
+configured TTL. Published files use unique temporary names in the destination
+directory and clean them up on ordinary errors. Process death can leave an
+unpublished temporary file. Unique names prevent collisions. Protecting a
+read-modify-write also requires serializing the read and the write, as the
+partition lock does for cutting, updating the runtime estimate and publishing
+merge status. The recovery contract covers process exit. Power-loss durability
+depends on the storage system. `selftest-fs` exercises local-process mkdir
+contention on the selected mount. Validate lock visibility, namespace coherence
+and client-death recovery between deployment hosts before using a shared mount.
 
 `read_json` returns its default for ledger files deleted during a read or
 containing incomplete content; the next tick re-derives state so transient
@@ -87,7 +125,9 @@ with its traceback to `<root>/scheduler/log/scheduler.log`, then the loop
 waits for the poll interval and retries. Only `--once` propagates the exception
 to the CLI.
 
-Existing ledgers use this same schema. Old `pool_snapshot` objects with
+Upgrade an existing ledger in place after draining all old writers, including
+queued workers. Mixed-version writers are unsupported because old workers
+bypass the shard and partition locks. Old `pool_snapshot` objects with
 top-level `column` and `lmms_root` are normalized when a worker must recover
 configuration from a snapshot.
 
@@ -108,8 +148,10 @@ lookahead cuts, merges terminal partitions, and finally submits workers for
 remaining demand. A non-blocking `flock` on `scheduler/lock` enforces one
 scheduler per ledger.
 
-A lease returns to pending when it is older than its TTL and the launcher is no
-longer alive; at twice the TTL it returns unconditionally. Preemption-like
+A lease can expire after one TTL when the launcher no longer reports a live
+worker, or after two TTLs regardless of launcher state. Heartbeats run through
+session setup, execution and validation at most half a TTL apart by default.
+Preemption-like
 failures count toward `max_preemptions`; other failures count toward
 `max_errors`. A terminal partition with missing quarantined units can only
 produce a `partial` marker. `--require-complete` refuses that merge.

@@ -65,7 +65,7 @@ description: Use when asked to run, monitor, debug, or extend ShardQ, the filesy
 ```bash
 export SHARDQ_ROOT=/path/to/ledger            # shared filesystem visible to all workers
 export SHARDQ_POOLS=/path/to/pools.json       # see references/specs.md
-shardq selftest-fs --root "$SHARDQ_ROOT/_selftest"   # once per new filesystem; expect conflicts 0
+shardq selftest-fs --root "$SHARDQ_ROOT/_selftest"   # one-host mkdir probe; expect conflicts 0
 shardq register job.json --dry-run            # validates spec, prints pins, writes nothing
 shardq register job.json                      # lmms backend: add --pin-mode verify to use the tree in place
 mkdir -p "$SHARDQ_ROOT/scheduler/log"
@@ -144,6 +144,10 @@ Run `python -m unittest discover -s tests -v` afterwards.
   Normal `--exit-when-idle` completion does not need a restart until more work arrives.
   Preserve stdout/stderr to files and use `remain-on-exit off` for batch runs.
   Never run two.
+- Upgrade the scheduler and workers together after draining old writers, including
+  queued workers. Keep existing job, pool snapshot and attempt files. Leases now
+  require cross-host `flock` and coherent atomic symlink creation, unlink and rename.
+  Verify these on the actual mount across participating hosts. Keep lock files in place.
 - Never hand-edit or delete `lease/`, `attempts/`, `complete.json`, `failed.json`,
   `quarantine.json`, or `superseded.json`. Use `stop`, `split`, `merge`, or wait for lease
   expiry (`retry.lease_ttl_seconds`; twice that forces expiry regardless of the launcher).

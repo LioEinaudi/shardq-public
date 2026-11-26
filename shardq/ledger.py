@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
+import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -62,6 +64,7 @@ class ShardView:
     lease_owner: Optional[dict]
     heartbeat_unix: Optional[float]
     complete_attempts: List[str]
+    lease_present: bool = False
 
 
 @dataclass
@@ -123,7 +126,7 @@ def shard_state(shard_dir: Path, now: float) -> ShardState:
         return ShardState.DONE
     if (shard_dir / "quarantine.json").is_file():
         return ShardState.QUARANTINED
-    if (shard_dir / "lease").is_dir():
+    if os.path.lexists(shard_dir / "lease"):
         return ShardState.LEASED
     failures = _attempt_failures(shard_dir)
     if failures:
@@ -135,9 +138,49 @@ def shard_state(shard_dir: Path, now: float) -> ShardState:
 
 def _read_heartbeat(path: Path) -> Optional[float]:
     try:
-        return float(path.read_text(encoding="utf-8").strip())
-    except (FileNotFoundError, TypeError, ValueError):
+        stamp = float(path.read_text(encoding="utf-8").strip())
+        return stamp if math.isfinite(stamp) else None
+    except (FileNotFoundError, NotADirectoryError, IsADirectoryError, ValueError):
         return None
+
+
+def _lease_owner(lease: Path) -> Optional[dict]:
+    owner = read_json(lease / "owner.json")
+    if not isinstance(owner, dict):
+        return None
+    attempt = owner.get("attempt_id")
+    if not isinstance(attempt, str) or not attempt or attempt == ".." or Path(attempt).name != attempt or "\0" in attempt:
+        return None
+    try:
+        if not math.isfinite(float(owner.get("acquired_unix"))):
+            return None
+        if lease.is_symlink() and os.readlink(lease) != ".lease-owner":
+            return None
+    except (TypeError, ValueError, OverflowError, FileNotFoundError):
+        return None
+    return owner
+
+
+def _remove_lease(lease: Path) -> None:
+    # The caller holds lease.lock. Old ledgers have a physical directory.
+    if lease.is_symlink() or not lease.is_dir():
+        lease.unlink()
+    else:
+        shutil.rmtree(lease)
+
+
+def _release_if_owned(claim: Claim) -> None:
+    lease = claim.shard_dir / "lease"
+    owner = _lease_owner(lease)
+    if owner and owner["attempt_id"] == claim.attempt_id:
+        _remove_lease(lease)
+
+
+def _claimable(shard: ShardView, retry: dict) -> bool:
+    # Leave exhausted shards pending so the scheduler can split or quarantine.
+    return (shard.state == ShardState.PENDING
+            and shard.errors < int(retry.get("max_errors", 3))
+            and shard.preemptions < int(retry.get("max_preemptions", 20)))
 
 
 class Ledger:
@@ -160,7 +203,7 @@ class Ledger:
         preemptions = sum(str(row.get("reason")) in PREEMPTION_REASONS for row in failures)
         latest_failure = max(failures, key=lambda row: float(row.get("failed_unix", 0))) if failures else {}
         retry_after = float(latest_failure.get("retry_after_unix", 0))
-        owner = read_json(shard_dir / "lease" / "owner.json")
+        lease = shard_dir / "lease"
         completed = sorted(path.parent.name for path in (shard_dir / "attempts").glob("*/complete.json"))
         return ShardView(
             shard_id=str(metadata.get("shard_id", shard_dir.name)),
@@ -172,8 +215,9 @@ class Ledger:
             preemptions=preemptions,
             retry_after_unix=retry_after,
             depth=int(metadata.get("depth", 0)),
-            lease_owner=owner if isinstance(owner, dict) else None,
-            heartbeat_unix=_read_heartbeat(shard_dir / "lease" / "heartbeat"),
+            lease_owner=_lease_owner(lease),
+            lease_present=os.path.lexists(lease),
+            heartbeat_unix=_read_heartbeat(lease / "heartbeat"),
             complete_attempts=completed,
         )
 
@@ -229,11 +273,12 @@ class Ledger:
         worker: dict,
         prefer_partition: Optional[str],
         prefer_session_key: Optional[str],
-        now: float,
+        now: Optional[float] = None,
     ) -> Optional[Claim]:
+        scan_time = time.time() if now is None else now
         candidates = []
         for job_id in job_ids or self.list_jobs():
-            job = self.scan_job(job_id, now)
+            job = self.scan_job(job_id, scan_time)
             if job.pool != pool or job.stopped:
                 continue
             priority = int(job.spec.get("priority", 0))
@@ -246,14 +291,7 @@ class Ledger:
                     continue
                 remaining = partition.pending + partition.backoff
                 for shard in partition.shards:
-                    if shard.state != ShardState.PENDING:
-                        continue
-                    if (
-                        shard.errors >= int(retry.get("max_errors", 3))
-                        or shard.preemptions >= int(retry.get("max_preemptions", 20))
-                    ):
-                        # Leave threshold-exceeded shards pending so the scheduler
-                        # has a durable window in which to split or quarantine them.
+                    if not _claimable(shard, retry):
                         continue
                     candidates.append(
                         (
@@ -272,19 +310,29 @@ class Ledger:
         candidates.sort(key=lambda row: row[:6])
         for row in candidates:
             job, partition, shard, session_key = row[6], row[7], row[8], row[9]
-            shard_dir = self.job_dir(job.job_id) / "partitions" / partition.name / "shards" / shard.shard_id
-            lease = shard_dir / "lease"
-            try:
-                os.mkdir(str(lease))
-            except FileExistsError:
-                continue
-            acquired = float(now)
+            claim = self._claim_shard(job, partition, shard, session_key, worker, now)
+            if claim is not None:
+                return claim
+        return None
+
+    def _claim_shard(self, job: JobView, partition: PartitionView, shard: ShardView,
+                     session_key: str, worker: dict, now: Optional[float]) -> Optional[Claim]:
+        job_dir = self.job_dir(job.job_id)
+        shard_dir = job_dir / "partitions" / partition.name / "shards" / shard.shard_id
+        with file_lock(shard_dir / "lease.lock"):
+            if (job_dir / "STOP").exists():
+                return None
+            acquired = time.time() if now is None else now
+            current = self._scan_shard(shard_dir, acquired)
+            if not _claimable(current, job.spec.get("retry") or {}):
+                return None
             attempt_epoch = int(acquired)
             attempt_id = f"{worker['worker_id']}-{attempt_epoch}"
+            if Path(attempt_id).name != attempt_id:
+                raise ValueError("worker_id must be a single path component")
             attempt_dir = shard_dir / "attempts" / attempt_id
             while attempt_dir.exists():
                 attempt_epoch += 1
-                acquired = float(attempt_epoch)
                 attempt_id = f"{worker['worker_id']}-{attempt_epoch}"
                 attempt_dir = shard_dir / "attempts" / attempt_id
             attempt_dir.mkdir(parents=True)
@@ -293,12 +341,19 @@ class Ledger:
                 "launcher": str(worker.get("launcher", "")),
                 "handle": str(worker.get("handle", "")),
                 "attempt_id": attempt_id,
-                "acquired_unix": acquired,
+                "acquired_unix": float(acquired),
                 "session_key": session_key,
             }
-            atomic_write_json(lease / "owner.json", owner)
             atomic_write_json(attempt_dir / "owner.json", owner)
-            _atomic_write_text(lease / "heartbeat", f"{now}\n")
+            # Stage outside the backend-owned output directory. Reuse is safe:
+            # the lock excludes writers and no lease currently points here.
+            staged = shard_dir / ".lease-owner"
+            staged.mkdir(exist_ok=True)
+            atomic_write_json(staged / "owner.json", owner)
+            # A slow scan, lock acquisition or setup write must not consume TTL.
+            published = time.time() if now is None else now
+            _atomic_write_text(staged / "heartbeat", f"{published}\n")
+            os.symlink(staged.name, shard_dir / "lease")
             return Claim(
                 job_id=job.job_id,
                 partition=partition.name,
@@ -311,13 +366,14 @@ class Ledger:
                 session_key=session_key,
                 est_seconds=float(shard.count) * partition.unit_seconds_est,
             )
-        return None
 
     def heartbeat(self, claim: Claim, now: float) -> None:
-        owner = read_json(claim.shard_dir / "lease" / "owner.json", {})
-        if owner.get("attempt_id") != claim.attempt_id:
-            raise RuntimeError(f"lease for {claim.shard_id} is no longer owned by {claim.attempt_id}")
-        _atomic_write_text(claim.shard_dir / "lease" / "heartbeat", f"{now}\n")
+        lease = claim.shard_dir / "lease"
+        with file_lock(claim.shard_dir / "lease.lock"):
+            owner = _lease_owner(lease)
+            if not owner or owner["attempt_id"] != claim.attempt_id:
+                raise RuntimeError(f"lease for {claim.shard_id} is no longer owned by {claim.attempt_id}")
+            _atomic_write_text(lease / "heartbeat", f"{now}\n")
 
     def complete(
         self,
@@ -337,25 +393,21 @@ class Ledger:
         if not target.is_file():
             raise FileNotFoundError(target)
         owner = read_json(claim.attempt_dir / "owner.json", {})
-        owner_before = read_json(claim.shard_dir / "lease" / "owner.json", {})
-        owned_before = owner_before.get("attempt_id") == claim.attempt_id
-        atomic_write_json(
-            claim.attempt_dir / "complete.json",
-            {
-                "attempt_id": claim.attempt_id,
-                "worker_id": owner.get("worker_id", claim.attempt_id.rsplit("-", 1)[0]),
-                "handle": owner.get("handle", ""),
-                "started_unix": started_unix,
-                "completed_unix": now,
-                "elapsed_seconds": elapsed_seconds,
-                "count": count,
-                "records_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
-                "backend_extra": backend_extra,
-            },
-        )
-        current = read_json(claim.shard_dir / "lease" / "owner.json", {})
-        if owned_before and current.get("attempt_id") == claim.attempt_id:
-            shutil.rmtree(str(claim.shard_dir / "lease"), ignore_errors=True)
+        payload = {
+            "attempt_id": claim.attempt_id,
+            "worker_id": owner.get("worker_id", claim.attempt_id.rsplit("-", 1)[0]),
+            "handle": owner.get("handle", ""),
+            "started_unix": started_unix,
+            "completed_unix": now,
+            "elapsed_seconds": elapsed_seconds,
+            "count": count,
+            "records_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+            "backend_extra": backend_extra,
+        }
+        with file_lock(claim.shard_dir / "lease.lock"):
+            # Valid late results participate in the same deterministic selection.
+            atomic_write_json(claim.attempt_dir / "complete.json", payload)
+            _release_if_owned(claim)
 
     def fail(
         self,
@@ -369,24 +421,20 @@ class Ledger:
         if reason not in FAILURE_REASONS:
             raise ValueError(f"invalid failure reason: {reason}")
         owner = read_json(claim.attempt_dir / "owner.json", {})
-        owner_before = read_json(claim.shard_dir / "lease" / "owner.json", {})
-        owned_before = owner_before.get("attempt_id") == claim.attempt_id
-        atomic_write_json(
-            claim.attempt_dir / "failed.json",
-            {
-                "attempt_id": claim.attempt_id,
-                "worker_id": owner.get("worker_id", claim.attempt_id.rsplit("-", 1)[0]),
-                "handle": owner.get("handle", ""),
-                "failed_unix": now,
-                "reason": reason,
-                "retryable": bool(retryable),
-                "error": error,
-                "retry_after_unix": now + int(backoff_seconds),
-            },
-        )
-        current = read_json(claim.shard_dir / "lease" / "owner.json", {})
-        if owned_before and current.get("attempt_id") == claim.attempt_id:
-            shutil.rmtree(str(claim.shard_dir / "lease"), ignore_errors=True)
+        with file_lock(claim.shard_dir / "lease.lock"):
+            failed = claim.attempt_dir / "failed.json"
+            if not failed.is_file() and not (claim.attempt_dir / "complete.json").is_file():
+                atomic_write_json(failed, {
+                    "attempt_id": claim.attempt_id,
+                    "worker_id": owner.get("worker_id", claim.attempt_id.rsplit("-", 1)[0]),
+                    "handle": owner.get("handle", ""),
+                    "failed_unix": now,
+                    "reason": reason,
+                    "retryable": bool(retryable),
+                    "error": error,
+                    "retry_after_unix": now + int(backoff_seconds),
+                })
+            _release_if_owned(claim)
 
     def cut(self, job_id: str, partition: str, count: int, est_seconds: float, now: float) -> str:
         if count <= 0:
@@ -440,38 +488,60 @@ class Ledger:
         job = self.scan_job(job_id, now)
         for partition in job.partitions.values():
             for shard in partition.shards:
-                if shard.state != ShardState.LEASED:
-                    continue
-                owner = shard.lease_owner or {}
-                heartbeat = shard.heartbeat_unix
-                if heartbeat is None:
-                    heartbeat = float(owner.get("acquired_unix", 0))
-                age = now - heartbeat
-                if age <= ttl_seconds or (age <= 2 * ttl_seconds and is_alive(owner)):
+                # A late completion may mask another live lease in shard.state.
+                if not shard.lease_present:
                     continue
                 shard_dir = self.job_dir(job_id) / "partitions" / partition.name / "shards" / shard.shard_id
-                attempt_id = str(owner.get("attempt_id", "unknown"))
-                attempt_dir = shard_dir / "attempts" / attempt_id
-                attempt_dir.mkdir(parents=True, exist_ok=True)
-                if not (attempt_dir / "complete.json").is_file():
-                    atomic_write_json(
-                        attempt_dir / "failed.json",
-                        {
-                            "attempt_id": attempt_id,
-                            "worker_id": owner.get("worker_id", ""),
-                            "handle": owner.get("handle", ""),
-                            "failed_unix": now,
-                            "reason": "lease_expired",
-                            "retryable": True,
-                            "error": f"heartbeat age {age:.3f}s exceeded ttl {ttl_seconds}s",
-                            "retry_after_unix": now,
-                        },
-                    )
-                current = read_json(shard_dir / "lease" / "owner.json", {})
-                if current.get("attempt_id") == attempt_id:
-                    shutil.rmtree(str(shard_dir / "lease"), ignore_errors=True)
+                if self._expire_lease(shard_dir, shard, ttl_seconds, is_alive, now):
                     expired.append(shard.shard_id)
         return expired
+
+    def _expire_lease(self, shard_dir: Path, shard: ShardView, ttl: int,
+                      is_alive: Callable[[dict], bool], now: float) -> bool:
+        lease = shard_dir / "lease"
+        owner = shard.lease_owner
+        if owner is not None:
+            heartbeat = shard.heartbeat_unix
+            last_seen = float(owner["acquired_unix"]) if heartbeat is None else heartbeat
+            age = now - last_seen
+            if age <= ttl or (age <= 2 * ttl and is_alive(owner)):
+                return False
+        with file_lock(shard_dir / "lease.lock"):
+            current = _lease_owner(lease)
+            if not os.path.lexists(lease) or current != owner:
+                return False
+            if current is None:
+                # A previous version could die inside mkdir(lease) -> write(owner).
+                # With no usable identity, give it two TTLs and charge no attempt.
+                last_change = lease.lstat().st_mtime
+                owner_path = lease / "owner.json"
+                if owner_path.is_file():
+                    last_change = max(last_change, owner_path.stat().st_mtime)
+                if now - last_change <= 2 * ttl:
+                    return False
+            else:
+                # A heartbeat may have landed while the launcher was queried.
+                # Honor it unless even the updated time exceeds the hard limit.
+                heartbeat = _read_heartbeat(lease / "heartbeat")
+                if heartbeat != shard.heartbeat_unix:
+                    age = now - (float(current["acquired_unix"]) if heartbeat is None else heartbeat)
+                    if age <= 2 * ttl:
+                        return False
+                attempt_dir = shard_dir / "attempts" / current["attempt_id"]
+                failed = attempt_dir / "failed.json"
+                if not failed.is_file() and not (attempt_dir / "complete.json").is_file():
+                    atomic_write_json(failed, {
+                        "attempt_id": current["attempt_id"],
+                        "worker_id": current.get("worker_id", ""),
+                        "handle": current.get("handle", ""),
+                        "failed_unix": now,
+                        "reason": "lease_expired",
+                        "retryable": True,
+                        "error": f"heartbeat age {age:.3f}s exceeded ttl {ttl}s",
+                        "retry_after_unix": now,
+                    })
+            _remove_lease(lease)
+            return True
 
     def _find_shard(self, job_id: str, shard_id: str) -> Tuple[Path, dict]:
         for path in (self.job_dir(job_id) / "partitions").glob("*/shards/*"):

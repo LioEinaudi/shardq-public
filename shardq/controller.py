@@ -185,6 +185,7 @@ def _job_summary(job) -> dict:
                 "quarantined_units": row.quarantined_units,
                 "done": row.done,
                 "leased": row.leased,
+                "active_leases": sum(shard.lease_present for shard in row.shards),
                 "pending": row.pending,
                 "backoff": row.backoff,
                 "quarantined": row.quarantined,
@@ -538,7 +539,7 @@ def run_scheduler(
                     for worker in state["workers"]
                 )
                 leased = any(
-                    partition.get("leased", 0) > 0
+                    partition.get("active_leases", partition.get("leased", 0)) > 0
                     for job in state["jobs"]
                     for partition in job["partitions"].values()
                 )

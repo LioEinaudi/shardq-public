@@ -6,6 +6,7 @@ import socket
 import threading
 import time
 import traceback
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import List, Optional
@@ -67,12 +68,24 @@ def _identity(root: Path, pool: PoolSpec, worker_id: str) -> dict:
     }
 
 
-def _heartbeat_loop(ledger: Ledger, claim: Claim, stop: threading.Event, seconds: int) -> None:
+def _heartbeat_loop(ledger: Ledger, claim: Claim, stop: threading.Event, seconds: float) -> None:
     while not stop.wait(seconds):
         try:
             ledger.heartbeat(claim, time.time())
         except Exception:
             return
+
+
+@contextmanager
+def _maintain_lease(ledger: Ledger, claim: Claim, interval: float):
+    stop = threading.Event()
+    thread = threading.Thread(target=_heartbeat_loop, args=(ledger, claim, stop, interval), daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
 
 
 def run_worker(
@@ -95,7 +108,6 @@ def run_worker(
     session_key = None
     prefer_partition = None
     active_claim = None
-    current_retry = None
 
     # The launcher learns the external handle only after submission returns.
     # Wait briefly so the first claimed lease records that durable handle.
@@ -124,7 +136,6 @@ def run_worker(
                 _identity(root, pool_spec, worker_id),
                 prefer_partition,
                 session_key,
-                now,
             )
             if claim is None:
                 if idle >= idle_exit_seconds:
@@ -137,84 +148,65 @@ def run_worker(
             active_claim = claim
             job_spec = read_json(ledger.job_dir(claim.job_id) / "job.json", {})
             current_retry = dict(job_spec.get("retry") or {})
-            backend = get_backend(str(job_spec["backend"]))(
-                dict(job_spec.get("backend_args") or {}),
-                asdict(pool_spec),
-                dict(job_spec.get("pins") or {}),
-            )
-            if session is None or session_key != claim.session_key:
-                if session is not None:
-                    session.close()
+            interval = min(heartbeat_seconds, float(current_retry.get("lease_ttl_seconds", 900)) / 2)
+            with _maintain_lease(ledger, claim, interval):
+                backend = get_backend(str(job_spec["backend"]))(
+                    dict(job_spec.get("backend_args") or {}),
+                    asdict(pool_spec),
+                    dict(job_spec.get("pins") or {}),
+                )
+                if session is None or session_key != claim.session_key:
+                    if session is not None:
+                        session.close()
+                    try:
+                        session = backend.open_session()
+                        session_key = claim.session_key
+                    except Exception:
+                        ledger.fail(
+                            claim,
+                            "session_error",
+                            True,
+                            traceback.format_exc()[-4000:],
+                            int(current_retry.get("backoff_seconds", 300)),
+                            time.time(),
+                        )
+                        active_claim = None
+                        return 2
+                started = time.time()
                 try:
-                    session = backend.open_session()
-                    session_key = claim.session_key
-                except PreemptedError:
-                    ledger.fail(claim, "preempted", True, "worker received termination signal", 0, time.time())
-                    active_claim = None
-                    return 143
+                    result = session.run_range(
+                        claim.partition, claim.start, claim.count, claim.attempt_dir
+                    )
+                    backend.validate_range(claim.partition, claim.start, claim.count, result)
+                    ledger.complete(
+                        claim,
+                        result.records_file,
+                        result.count,
+                        started,
+                        result.elapsed_seconds,
+                        result.extra,
+                        time.time(),
+                    )
+                    prefer_partition = claim.partition
+                except RangeValidationError as exc:
+                    ledger.fail(
+                        claim,
+                        "validation_error",
+                        True,
+                        str(exc),
+                        int(current_retry.get("backoff_seconds", 300)),
+                        time.time(),
+                    )
                 except Exception:
                     ledger.fail(
                         claim,
-                        "session_error",
+                        "backend_error",
                         True,
                         traceback.format_exc()[-4000:],
                         int(current_retry.get("backoff_seconds", 300)),
                         time.time(),
                     )
-                    active_claim = None
-                    return 2
-            started = time.time()
-            stop = threading.Event()
-            heartbeat = threading.Thread(
-                target=_heartbeat_loop,
-                args=(ledger, claim, stop, heartbeat_seconds),
-                daemon=True,
-            )
-            heartbeat.start()
-            try:
-                result = session.run_range(
-                    claim.partition, claim.start, claim.count, claim.attempt_dir
-                )
-                backend.validate_range(claim.partition, claim.start, claim.count, result)
-                ledger.complete(
-                    claim,
-                    result.records_file,
-                    result.count,
-                    started,
-                    result.elapsed_seconds,
-                    result.extra,
-                    time.time(),
-                )
-                prefer_partition = claim.partition
-            except PreemptedError:
-                ledger.fail(claim, "preempted", True, "worker received termination signal", 0, time.time())
-                if session is not None:
-                    session.close()
-                    session = None
-                active_claim = None
-                return 143
-            except RangeValidationError as exc:
-                ledger.fail(
-                    claim,
-                    "validation_error",
-                    True,
-                    str(exc),
-                    int(current_retry.get("backoff_seconds", 300)),
-                    time.time(),
-                )
-            except Exception:
-                ledger.fail(
-                    claim,
-                    "backend_error",
-                    True,
-                    traceback.format_exc()[-4000:],
-                    int(current_retry.get("backoff_seconds", 300)),
-                    time.time(),
-                )
-            finally:
-                stop.set()
-                heartbeat.join(timeout=max(1.0, heartbeat_seconds))
-                active_claim = None
+            active_claim = None
     except PreemptedError:
         if active_claim is not None:
             ledger.fail(active_claim, "preempted", True, "worker received termination signal", 0, time.time())

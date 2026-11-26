@@ -31,9 +31,9 @@ the desired worker count so cutting can supply enough shards for scale-up.
 `bisect` true, `lease_ttl_seconds` 900. Exceeding either limit bisects the shard while
 `bisect` is true, it has more than one unit, and depth is below `log2(max_units)`;
 otherwise it is quarantined. `backoff_seconds` delays re-claiming after a failure.
-`lease_ttl_seconds` should exceed the longest expected single-range runtime plus queue
-jitter; a lease older than the TTL is released once the launcher reports the worker gone,
-and unconditionally at twice the TTL.
+Choose a TTL that allows for heartbeat jitter and clock skew. A lease older
+than the TTL is released if the launcher no longer reports a live worker,
+or unconditionally after two TTLs.
 
 `traits.<partition>.max_parallel` caps concurrently leased shards of that partition.
 

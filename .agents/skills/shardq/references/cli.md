@@ -81,9 +81,9 @@ then `$SHARDQ_POOLS`, then `<root>/pools.json`, else error. Any `ValueError`,
   `pool.env` exported. `examples/lmms-worker.sh` shows the expected entry script.
 - Pool configuration comes from the pools file, or from the job's `pool_snapshot` when
   no pools file is reachable.
-- Loop: claim a shard, open or reuse the backend session (rebuilt only when the
-  `session_key` changes), run the range, validate that records cover exactly
-  `[start, start + count)`, write `complete.json`. Heartbeats every 60 s.
+- After claim, heartbeats cover setup and execution every 60 seconds or half the
+  job's TTL, whichever is shorter. The worker opens or reuses its session, runs
+  the range, validates coverage and writes `complete.json`.
 - Exits when the remaining wall clock is under 1.5 times the next shard estimate, or
   after `idle-exit-seconds` without a claim.
 - `SIGTERM` or `SIGINT` writes a `preempted` failure for the active attempt and exits 143.
@@ -126,8 +126,9 @@ then `$SHARDQ_POOLS`, then `<root>/pools.json`, else error. Any `ValueError`,
 ## selftest-fs --root PATH [--procs 16] [--rounds 200]
 
 - Races `procs` processes on `os.mkdir` per round. Expect
-  `single_winner_rounds == rounds` and `conflicts == 0`. Run once for every new
-  filesystem before trusting it as a ledger. Leaves a `run-*` directory under PATH.
+  `single_winner_rounds == rounds` and `conflicts == 0`. This covers processes
+  on one host. Verify cross-host lock exclusion and coherent symlink and rename
+  behavior on the deployment mount separately. Leaves a `run-*` directory under PATH.
 
 ## lmms-merge-check --samples S.jsonl --results R.json (--lmms-root ROOT --local-python PY | --pool POOL)
 
