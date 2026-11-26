@@ -66,6 +66,7 @@ jobs/<job>/partitions/<partition>/shards/<shard>/
 jobs/<job>/merged/<partition>/{results.json,records.jsonl,merge.json}
 jobs/<job>/markers/<column>/<partition>.complete.json|partial.json
 workers/<worker>.json
+workers/<worker>.starts/<process-receipt>.json
 scheduler/{lock,state.json,status.md,log/scheduler.log}
 history.json
 ```
@@ -187,13 +188,113 @@ original budget. Missing epochs denote the initial cycle, including earlier
 reconstructs all three from the ledger. A batch scheduler waits through
 temporary backoff and may exit with paused jobs once workers and leases drain.
 
+## Worker submission recovery
+
+The root scheduler lock gives one writer authority over
+`workers/<worker_id>.json`. Each parallel submit thread owns one such row.
+The scheduler writes **all** intents in a pool's admitted batch before starting
+its threads. Each thread publishes `submitting` before entering the launcher,
+then publishes its own outcome as soon as the call returns. These are atomic
+same-directory file replacements. A replacement that exposes `submitting`
+is the point after which a restart must assume the platform could have created
+a task, including when the process died immediately before the external call.
+The worker rows rebuild reservations even if `scheduler/state.json` predates
+the batch. This protocol covers process exits under the filesystem contract above.
+
+| On-disk submission state | Evidence and permitted next action |
+| --- | --- |
+| `intent` | Capacity reserved, external call not entered. With matching configuration and current demand, dispatch the same ID. Withdraw to `terminal` if the demand or worker limit has fallen. |
+| `submitting` | External call may be in flight. A live caller can confirm a handle, record a definite creation rejection, or report uncertainty. After restart, reconcile before any new admission. |
+| `rejected` | Explicit pre-creation rejection. Releases capacity. An eligible tick can reserve the same ID again for the same fingerprint. Changed requests get a new ID. |
+| `uncertain` | Outcome unknown. Persist the error and `reconcile_after_unix`. After 300 seconds query again. Failure, a partial listing, unsupported lookup and zero matches all retain capacity. |
+| `confirmed` | A creation receipt, complete unique lookup, or verified operator decision supplied a nonempty handle. Poll that handle in the original pool. Query errors preserve the last known status and the reservation. |
+| `conflict` | Multiple matching handles, or a change in request identity/configuration. Hold the reservation for offline resolution. |
+| `terminal` | The known task is terminal, all possible tasks were verified terminal, or an uncalled intent was withdrawn. Releases capacity. Remaining runnable work can now require a new worker. |
+
+New requests use `shardq-<uuid>` for both `worker_id` and `request_id`,
+including the worker environment and cloud task name. A SHA-256 fingerprint
+covers the worker arguments, explicit environment, execution settings and
+provider configuration. Admission limits can change independently. Volc also
+hashes the actual template, AIHC hashes an explicitly configured CLI config
+file, and local includes host, Python executable and working directory.
+Keep the CLI account, region, PID namespace, deployed entry scripts, images
+and external configuration stable across submit and recovery. The digest
+identifies the configured request. It does not pin remote image contents or
+discover changes to a CLI's implicit credentials.
+
+**Capacity.** An intent or unresolved call holds a worker slot, a potential
+queued position when `max_queued` applies, and its requested GPU slots. A
+multiple-match conflict holds one reservation per known distinct match.
+Reusing an uncalled intent consumes its existing reservation first. An
+unresolved request stays charged to the original Volc queue/creator during
+GPU admission, even across ShardQ pools or a change of configuration. An audit
+may already include an unbound task. The extra deduction can temporarily
+underuse the queue. Once confirmed, the same worker row is polled and the
+provider audit accounts for its resources. A named pool retains outstanding
+reservations when its configured launcher changes. A usable queue audit
+still requires a complete, current provider view of other consumers.
+
+Each tick reconciles existing submissions before evaluating job demand. A
+job with `claims_blocked` contributes no new demand. Setup backoff, paused
+epochs, active lease drain and merge drain use the Stage A ledger. An
+unresolved row prevents idle exit even after STOP. A failed admission query
+backs off its pool. Pools sharing a Volc GPU budget still respect each other's
+reservations.
+
+**Worker startup.** A managed worker checks its environment request ID
+against the scheduler's row, then atomically publishes its own startup receipt
+in `workers/<id>.starts/`. It may claim immediately during `submitting`,
+`uncertain` or `confirmed`. It rechecks the state before seeking more work.
+In-flight ranges retain their ordinary completion and lease rules. A lease
+can carry an empty handle from an early claim. Liveness follows its stable
+worker ID within the pool, so a later handle applies to the existing lease
+without rewriting its owner. A cloud startup receipt proves that a process
+started and cannot by itself identify its remote handle.
+
+| Launcher | Evidence available after a lost create acknowledgement |
+| --- | --- |
+| local | A Linux worker receipt identifies host, boot ID, PID and process start ticks. A restarted scheduler on the same host and PID namespace can recognize the original process or its termination, even after PID reuse. Pre-receipt exits and unreadable, incomplete or unavailable receipts can remain uncertain. Without procfs an acknowledged local launch can use the legacy PID handle, with the same PID-reuse limitations. |
+| volc | A successful create returns a task ID, and get-by-ID can poll it. The capacity listing filters finished tasks. It provides insufficient evidence for complete historical request lookup. An ambiguous create requires operator evidence. |
+| aihc | A successful create returns a job ID scoped by pool and queue. Status uses get-by-ID. The adapter has no verified complete lookup by submitted name. An ambiguous create requires operator evidence. |
+
+`lookup_submission(request_id)` may return distinct exact handles only when
+the search covers the original request scope and includes terminal tasks.
+An incomplete search raises. Even a complete empty result may reflect
+visibility delay. None of the built-ins assumes an idempotent create API.
+Only explicit pre-creation rejections permit automatic create retries.
+
+**Offline resolution.** Inspect `shardq status --json`, including
+`match_handles`, `started_count`, errors and reconciliation time. Stop the
+scheduler and verify the provider account, queue and full history, including
+any call that could still complete. Run `resolve-submission` with the worker
+ID and written evidence. The command takes the same root scheduler lock.
+
+- `--handle H` binds the verified task. For a conflict, supply a
+  `--terminal-match H` for each other candidate that the provider confirms
+  has finished. A handle already bound or matched by another live request
+  in the same pool and launcher cannot be reassigned this way.
+- `--not-created` reopens safe creation retry only after verified noncreation.
+  A recorded start, handle or match blocks this action.
+- `--terminal` records that all possible tasks finished and releases capacity.
+
+The row retains the decision, time, evidence, prior state and original
+matches under `resolutions`. Restore the original execution configuration
+before tracking a rebound handle. Restart the scheduler after resolution.
+
+Old worker JSON has no `submission_state`, request fingerprint or receipts.
+It continues to use its recorded handle and prior terminal status. Missing
+receipt directories indicate zero recorded starts. A directly invoked worker
+needs no submission record. Upgrade after stopping and draining old writers,
+and account separately for earlier unrecorded cloud calls. Mixed-version
+writers cannot enforce this protocol.
+
 ## Pool configuration
 
 A pools file has a top-level `pools` object. Each pool contains:
 
 - `backend`: built-in name or `module:Class`
 - `entry`: absolute container entry script; ignored by the local launcher
-- `launcher`: `local` or `volc`
+- `launcher`: `local`, `volc` or `aihc`
 - `volc`: queue, flavor, `gpu_slots`, image, preemptible, priority,
   `vepfs_id`, capacity mode, and capacity fields
 - `env`: worker environment additions
@@ -225,9 +326,10 @@ resolved-import proof.
 
 ```bash
 python -m shardq register SPEC.json [--pin-mode worktree|verify]
-python -m shardq scheduler [--launcher local|volc] [--exit-when-idle]
+python -m shardq scheduler [--launcher local|volc|aihc] [--exit-when-idle]
 python -m shardq worker --pool POOL
 python -m shardq status [--job JOB] [--json]
+python -m shardq resolve-submission --worker-id ID (--handle H | --not-created | --terminal) --evidence TEXT
 python -m shardq merge --job JOB [--partition TASK] [--allow-partial]
 python -m shardq split --job JOB --shard SHARD
 python -m shardq stop|resume --job JOB

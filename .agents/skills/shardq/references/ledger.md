@@ -9,7 +9,8 @@ scheduler/lock                                 flock; one scheduler per root
 scheduler/state.json                           last tick: jobs, workers, actions, warnings, pool_backoff
 scheduler/status.md                            human view of state.json
 scheduler/log/scheduler.log                    tick log with tracebacks
-workers/<worker_id>.json                       handle, last_status, dead, submitted_unix
+workers/<worker_id>.json                       scheduler-owned submission record and latest provider status
+workers/<worker_id>.starts/<uuid>.json         one worker process's startup receipt
 workers/<worker_id>.log                        local launcher stdout/stderr
 workers/<worker_id>.yaml                       Volc task YAML as submitted
 jobs/<job>/job.json                            spec + pins + pool_snapshot + session_key + column
@@ -31,6 +32,41 @@ src/                                            detached source worktrees from -
 
 Shard ids are `<partition>-<start:06d>-<end:06d>`, so the unit range is visible in the
 directory name.
+
+## Worker submissions
+
+`workers/<worker_id>.json` stores the stable `request_id` (equal to `worker_id`),
+pool, launcher, request fingerprint and reserved `gpu_slots`. Volc also records
+the original queue and creator for cross-pool GPU accounting. An old record
+without `submission_state` continues to use its existing handle and status.
+No pool or job configuration migration is needed.
+
+| `submission_state` | Recovery and capacity |
+|---|---|
+| `intent` | External submit has not started. Recheck demand, caps and fingerprint, then dispatch this ID or withdraw unused capacity. |
+| `submitting` | The scheduler may have entered the external call. Reconcile the existing ID while holding capacity. |
+| `rejected` | The provider explicitly rejected before creation. Eligible for retry under the same ID and current admission limits. |
+| `confirmed` | A handle is known. Poll it in this pool and count the worker once until terminal. |
+| `uncertain` | An ambiguous submit or lookup preserves the reservation. `reconcile_after_unix` is the next query time. |
+| `conflict` | Multiple task matches or changed identity/configuration require investigation. Count each known matching handle, with at least one reservation. |
+| `terminal` | Provider terminal, verified terminal, or a saved intent withdrawn before submit. No remaining reservation. |
+
+Worker starts are independent of scheduler acknowledgements. Each receipt records
+the worker and request IDs, host, PID and start time. The lease owner may have an empty
+handle if the worker claimed early. The scheduler follows `worker_id` within its pool
+to locate the eventual handle. Preserve the worker record and all start receipts.
+
+The local launcher can match Linux startup receipts containing process generation
+(host, boot ID, PID and start ticks), including workers that exited before lookup.
+Zero visible receipts leave the outcome open. Volc and AIHC can poll a known handle.
+Their current adapters lack complete request-ID lookup across live and terminal tasks.
+A cloud startup receipt shows that a worker ran but cannot establish the platform
+handle. After verifying provider evidence, use `resolve-submission` in
+`references/cli.md`. When binding one of several matches, the audit entry in
+`resolutions` records the other certified terminal handles in `terminal_matches`.
+These records cover scheduler process exits on a coherent shared filesystem with
+atomic same-directory rename and working scheduler locks. Power-loss durability
+and the deployment mount's cross-host semantics need separate verification.
 
 ## State derivation (strict order)
 
@@ -82,9 +118,10 @@ If it runs much longer, read the merge traceback in `scheduler.log`.
 
 Nothing is being submitted
 : `state.json` `warnings` names the reason (submit failure, merge failure, unknown pool).
-`pool_backoff` shows a pool parked for 300 s after a failed submit. Demand is zero when
-every partition is cut and no shard is pending; check `partition.json.next_cut` against
-`size` and the per-partition `pending` count in `shardq status`.
+Check `pool_backoff`, `submission_state`, `submission_error`, `status_error` and
+`reconcile_after_unix`. An unresolved request can occupy the last worker, queue or GPU
+slot. Check the job's setup pause/backoff and STOP, then compare `partition.json.next_cut`
+with `size` and the per-partition pending, backoff and leased counts in `shardq status`.
 
 Workers sit in `queued`
 : Volc idle queue is waiting for free GPUs. Probe mode stops submitting once
@@ -123,7 +160,8 @@ launcher problem; follow the traceback to fix it. No scheduler restart is needed
 Scheduler process gone, log ends with a normal tick
 : the process may have been killed by a signal or, on versions without tick retries,
 crashed on transient ledger state. Check the last output in the tmux window or
-stderr file before restarting. The ledger needs no manual intervention.
+stderr file before restarting. A fresh scheduler restores existing worker reservations.
+Inspect `uncertain` or `conflict` rows for provider evidence needed to resolve them.
 
 Merge failed
 : the scheduler retries after 600 s and logs the traceback in `scheduler.log`. For the
@@ -142,6 +180,6 @@ Safe: `shardq stop`/`resume`, `shardq split`, `shardq merge --allow-partial`, re
 any file, deleting `workers/*.log`, registering a new job, killing a worker process or
 Volc task (it becomes a preemption).
 
-Unsafe: removing or editing anything under `shards/`, touching `history.json` while a
+Unsafe: deleting or editing worker records or startup receipts, removing or editing anything under `shards/`, touching `history.json` while a
 scheduler runs, running two schedulers, editing `job.json` after registration (pins and
 pool snapshot are provenance), reusing a job id after deleting its directory.
