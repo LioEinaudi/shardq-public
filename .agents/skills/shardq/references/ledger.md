@@ -16,9 +16,12 @@ jobs/<job>/job.json                            spec + pins + pool_snapshot + ses
 jobs/<job>/STOP                                present while the job is stopped
 jobs/<job>/setup_epoch.json                    resume generation (missing = initial cycle)
 jobs/<job>/partitions/<p>/partition.json       size, source_size, next_cut, unit_seconds_est, status
+jobs/<job>/partitions/<p>/partition.lock       permanent lock for partition metadata updates
 jobs/<job>/partitions/<p>/shards/<shard>/shard.json        start, count, depth, est_seconds
-jobs/<job>/partitions/<p>/shards/<shard>/lease/owner.json  worker_id, handle, attempt
-jobs/<job>/partitions/<p>/shards/<shard>/lease/heartbeat   unix seconds, interval at most half TTL
+jobs/<job>/partitions/<p>/shards/<shard>/lease.lock        permanent lock for lease mutations
+jobs/<job>/partitions/<p>/shards/<shard>/lease -> .lease-owner    symlink present while leased
+jobs/<job>/partitions/<p>/shards/<shard>/.lease-owner/owner.json  worker_id, handle, attempt
+jobs/<job>/partitions/<p>/shards/<shard>/.lease-owner/heartbeat   unix seconds, interval at most half TTL
 jobs/<job>/partitions/<p>/shards/<shard>/attempts/<a>/records.jsonl
 jobs/<job>/partitions/<p>/shards/<shard>/attempts/<a>/raw/            backend raw output
 jobs/<job>/partitions/<p>/shards/<shard>/attempts/<a>/complete.json | failed.json
