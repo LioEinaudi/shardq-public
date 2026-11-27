@@ -145,3 +145,7 @@ skill roots:
 ln -sfn "$PWD/.agents/skills/shardq" ~/.codex/skills/shardq
 ln -sfn "$PWD/.agents/skills/shardq" ~/.claude/skills/shardq
 ```
+
+## License
+
+Copyright 2026 LioEinaudi. Licensed under the [Apache License, Version 2.0](LICENSE).
