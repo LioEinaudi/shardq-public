@@ -25,6 +25,8 @@ def execute_backend_op(op: str, payload: dict) -> dict:
         dict(payload.get("pool") or {}),
         dict(payload.get("pins") or {}),
     )
+    if op == "session_key":
+        return {"session_key": backend.session_key()}
     if op == "describe":
         partitions = backend.describe()
         return {
@@ -63,8 +65,12 @@ def run_backend_op(pool: PoolSpec, op: str, payload: dict) -> dict:
     envelope.setdefault("backend_args", {})
     envelope.setdefault("pool", asdict(pool))
     envelope.setdefault("pins", {})
-    python = pool.local_python
-    if not python or Path(python).resolve() == Path(sys.executable).resolve():
+    python = pool.local_python or sys.executable
+    lmms_root = (envelope.get("pins") or {}).get("lmms_root")
+    # lmms source pins can change between jobs; sys.path cannot replace cached modules.
+    # A virtualenv may symlink its executable to the control interpreter.
+    if (not lmms_root and envelope["backend"] != "lmms_eval"
+            and os.path.abspath(python) == os.path.abspath(sys.executable)):
         return execute_backend_op(op, envelope)
     temporary = tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", suffix=".json", prefix="shardq-backend-", delete=False
@@ -76,7 +82,6 @@ def run_backend_op(pool: PoolSpec, op: str, payload: dict) -> dict:
         env = dict(os.environ)
         package_root = Path(__file__).resolve().parent.parent
         paths = [str(package_root)]
-        lmms_root = (envelope.get("pins") or {}).get("lmms_root")
         if lmms_root:
             paths.append(str(lmms_root))
         if env.get("PYTHONPATH"):
@@ -113,8 +118,8 @@ def run_backend_op(pool: PoolSpec, op: str, payload: dict) -> dict:
 
 def main(argv: list = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
-    if len(arguments) != 2 or arguments[0] not in {"describe", "merge"}:
-        print("usage: python -m shardq.backend_exec <describe|merge> <payload.json>", file=sys.stderr)
+    if len(arguments) != 2 or arguments[0] not in {"describe", "session_key", "merge"}:
+        print("usage: python -m shardq.backend_exec <describe|session_key|merge> <payload.json>", file=sys.stderr)
         return 2
     payload = json.loads(Path(arguments[1]).read_text(encoding="utf-8"))
     result = execute_backend_op(arguments[0], payload)

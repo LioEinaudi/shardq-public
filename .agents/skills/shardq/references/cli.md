@@ -40,7 +40,8 @@ then `$SHARDQ_POOLS`, then `<root>/pools.json`, else error. Any `ValueError`,
   A merge never blocks the tick; a failed merge is retried after 600 s and listed in
   `warnings`. `state.json` lists `merges_in_flight`.
 - Submission count per pool is `min(demand - live, pool.max_workers - live,
-  --max-submits-per-tick)`, where demand = pending + backoff + leased shards and live
+  --max-submits-per-tick)`, where demand = pending + backoff + leased shards of
+  jobs eligible for claims, and live
   counts queued plus running workers. Uncut units are never counted. Submissions run
   concurrently with up to 4 threads, with successful workers recorded in submission order.
   Volc `capacity_mode: probe` additionally caps queued workers at `volc.max_queued`;
@@ -60,8 +61,9 @@ then `$SHARDQ_POOLS`, then `<root>/pools.json`, else error. Any `ValueError`,
   (including startup failures and `KeyboardInterrupt`) appear only on stderr, so
   preserve stderr when starting the scheduler.
 - `--once` runs one tick and exits 0. `--exit-when-idle` exits 0 once every partition of
-  unstopped jobs is merged or partial, no non-terminal worker or lease remains, and
-  background merges have finished. Stopped jobs are left unfinished and require a
+  jobs outside manual STOP or setup pause is merged or partial, no non-terminal
+  worker or physical lease remains, and background merges have finished. Temporary
+  setup backoff keeps the scheduler waiting. Paused jobs require a
   scheduler restart when resumed after exit. Without this flag the scheduler keeps polling.
   Under tmux, persist stdout/stderr to files and use `remain-on-exit off` so
   exits close the window; `remain-on-exit on` retains even successfully completed panes.
@@ -81,9 +83,10 @@ then `$SHARDQ_POOLS`, then `<root>/pools.json`, else error. Any `ValueError`,
   `pool.env` exported. `examples/lmms-worker.sh` shows the expected entry script.
 - Pool configuration comes from the pools file, or from the job's `pool_snapshot` when
   no pools file is reachable.
-- Loop: claim a shard, open or reuse the backend session (rebuilt only when the
-  `session_key` changes), run the range, validate that records cover exactly
-  `[start, start + count)`, write `complete.json`. Heartbeats every 60 s.
+- After claim, heartbeats cover setup and execution every 60 seconds or half the
+  job's TTL, whichever is shorter. The worker checks backend identity and the
+  runtime session key before reuse, runs the range, validates exact coverage of
+  `[start, start + count)` and writes `complete.json`.
 - Exits when the remaining wall clock is under 1.5 times the next shard estimate, or
   after `idle-exit-seconds` without a claim.
 - `SIGTERM` or `SIGINT` writes a `preempted` failure for the active attempt and exits 143.
@@ -113,8 +116,10 @@ then `$SHARDQ_POOLS`, then `<root>/pools.json`, else error. Any `ValueError`,
 
 ## stop --job JOB and resume --job JOB
 
-- `stop` writes `jobs/<job>/STOP`; `resume` removes it. A stopped job is neither claimed
-  nor cut. Running attempts finish normally; workers with nothing to claim idle out.
+- `stop` writes `jobs/<job>/STOP`. `resume` starts a fresh setup budget and clears
+  STOP. It also releases setup backoff or pause. Existing failures stay available
+  for audit and range/preemption budgets retain their counts. Running attempts
+  finish normally and workers with nothing to claim idle out.
 
 ## publish --job JOB --out-dir DIR
 
@@ -126,8 +131,9 @@ then `$SHARDQ_POOLS`, then `<root>/pools.json`, else error. Any `ValueError`,
 ## selftest-fs --root PATH [--procs 16] [--rounds 200]
 
 - Races `procs` processes on `os.mkdir` per round. Expect
-  `single_winner_rounds == rounds` and `conflicts == 0`. Run once for every new
-  filesystem before trusting it as a ledger. Leaves a `run-*` directory under PATH.
+  `single_winner_rounds == rounds` and `conflicts == 0`. This covers processes
+  on one host. Verify cross-host lock exclusion and coherent symlink and rename
+  behavior on the deployment mount separately. Leaves a `run-*` directory under PATH.
 
 ## lmms-merge-check --samples S.jsonl --results R.json (--lmms-root ROOT --local-python PY | --pool POOL)
 

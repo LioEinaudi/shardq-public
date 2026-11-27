@@ -4,7 +4,6 @@ import fcntl
 import json
 import logging
 import math
-import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -15,6 +14,7 @@ from typing import Dict
 import shardq
 
 from .cutter import plan_cut, update_history
+from .fs import atomic_write_text
 from .launchers import get_launcher
 from .launchers.base import TransientSubmitError
 from .ledger import Ledger, ShardState, atomic_write_json, read_json
@@ -61,7 +61,7 @@ def _last_failure_reason(shard_dir: Path) -> str:
     failures = []
     for path in (shard_dir / "attempts").glob("*/failed.json"):
         payload = read_json(path, {})
-        if isinstance(payload, dict):
+        if isinstance(payload, dict) and payload.get("reason") not in ("session_error", "worker_restart"):
             failures.append(payload)
     if not failures:
         return "backend_error"
@@ -137,7 +137,7 @@ def _update_history(root: Path, jobs: list, now: float, actions: list) -> None:
         for partition in job.partitions.values():
             key = f"{backend}:{session_key}:{partition.name}"
             partition_dir = root / "jobs" / job.job_id / "partitions" / partition.name
-            partition_paths.setdefault(key, []).append(partition_dir / "partition.json")
+            partition_paths.setdefault(key, []).append((partition_dir / "partition.json", partition.unit_seconds_est))
             for shard in partition.shards:
                 shard_dir = partition_dir / "shards" / shard.shard_id
                 for complete_path in sorted((shard_dir / "attempts").glob("*/complete.json")):
@@ -164,12 +164,9 @@ def _update_history(root: Path, jobs: list, now: float, actions: list) -> None:
             changed = True
             actions.append({"action": "history", "key": key, "attempts": len(rows)})
         estimate = float(rebuilt[key]["unit_seconds"])
-        for metadata_path in partition_paths.get(key, []):
-            metadata = read_json(metadata_path, {})
-            if metadata.get("unit_seconds_est") != estimate:
-                metadata["unit_seconds_est"] = estimate
-                atomic_write_json(metadata_path, metadata)
-                changed = True
+        for metadata_path, previous_estimate in partition_paths.get(key, []):
+            if previous_estimate != estimate:
+                Ledger.update_partition(metadata_path, unit_seconds_est=estimate)
     if changed or not history_path.exists():
         atomic_write_json(history_path, history)
 
@@ -180,6 +177,9 @@ def _job_summary(job) -> dict:
         "pool": job.pool,
         "column": job.column,
         "stopped": job.stopped,
+        "setup_status": job.setup_status,
+        "session_errors": job.session_errors,
+        "session_retry_after_unix": job.session_retry_after_unix,
         "partitions": {
             name: {
                 "size": row.size,
@@ -188,6 +188,7 @@ def _job_summary(job) -> dict:
                 "quarantined_units": row.quarantined_units,
                 "done": row.done,
                 "leased": row.leased,
+                "active_leases": sum(shard.lease_present for shard in row.shards),
                 "pending": row.pending,
                 "backoff": row.backoff,
                 "quarantined": row.quarantined,
@@ -202,7 +203,10 @@ def _job_summary(job) -> dict:
 def _write_status(root: Path, state: dict) -> None:
     lines = ["# ShardQ scheduler status", "", f"Updated unix: {state['updated_unix']}", ""]
     for job in state["jobs"]:
-        lines.extend([f"## {job['job_id']}", "", "| partition | size | cut | done units | pending | leased | quarantined | status |", "|---|---:|---:|---:|---:|---:|---:|---|"])
+        lines.extend([f"## {job['job_id']}", ""])
+        if job["setup_status"] != "ready":
+            lines.extend([f"Session setup {job['setup_status']} ({job['session_errors']} failures).", ""])
+        lines.extend(["| partition | size | cut | done units | pending | leased | quarantined | status |", "|---|---:|---:|---:|---:|---:|---:|---|"])
         for name, row in job["partitions"].items():
             lines.append(
                 f"| {name} | {row['size']} | {row['next_cut']} | {row['done_units']} | "
@@ -216,10 +220,7 @@ def _write_status(root: Path, state: dict) -> None:
             f"{worker.get('handle', '')} | {worker.get('last_status', '')} |"
         )
     path = root / "scheduler" / "status.md"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.tmp-{os.getpid()}")
-    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    os.replace(str(temporary), str(path))
+    atomic_write_text(path, "\n".join(lines) + "\n")
 
 
 def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict, now: float) -> dict:
@@ -273,7 +274,7 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
     max_cuts = int(opts.get("max_cuts_per_tick", 64))
     for job_id in job_ids:
         job = ledger.scan_job(job_id, now)
-        if job.stopped:
+        if job.claims_blocked:
             continue
         shard_cfg = job.spec.get("shard") or {}
         lookahead = int(shard_cfg.get("lookahead", 4))
@@ -342,7 +343,7 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
         pool = pools[pool_name]
         if float(backoff.get(pool_name, 0)) > now:
             continue
-        pool_jobs = [job for job in current_jobs if job.pool == pool_name and not job.stopped]
+        pool_jobs = [job for job in current_jobs if job.pool == pool_name and not job.claims_blocked]
         pending = 0
         leased = 0
         for job in pool_jobs:
@@ -435,6 +436,15 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
                     actions.append({"action": "submit", "pool": pool_name, "worker_id": worker_id, "handle": handle})
 
     final_jobs = [ledger.scan_job(job_id, now) for job_id in job_ids]
+    for job in final_jobs:
+        if all(partition.status in {"merged", "partial"} for partition in job.partitions.values()):
+            continue
+        if job.setup_status == "backoff":
+            warnings.append(f"{job.job_id} session setup is in backoff after {job.session_errors} failures. "
+                            f"Inspect the session_error attempts. Setup can retry at Unix {job.session_retry_after_unix}.")
+        elif job.setup_status == "paused":
+            warnings.append(f"{job.job_id} session setup is paused after {job.session_errors} failures. "
+                            f"Repair the environment and run shardq resume --job {job.job_id}")
     state = {
         "schema_version": 1,
         "updated_unix": now,
@@ -536,7 +546,7 @@ def run_scheduler(
                 complete = all(
                     partition["status"] in {"merged", "partial"}
                     for job in state["jobs"]
-                    if not job.get("stopped", False)
+                    if not job.get("stopped", False) and job.get("setup_status") != "paused"
                     for partition in job["partitions"].values()
                 )
                 alive = any(
@@ -544,11 +554,21 @@ def run_scheduler(
                     for worker in state["workers"]
                 )
                 leased = any(
-                    partition.get("leased", 0) > 0
+                    partition.get("active_leases", partition.get("leased", 0)) > 0
                     for job in state["jobs"]
                     for partition in job["partitions"].values()
                 )
                 if complete and not alive and not leased and not state.get("merges_in_flight"):
-                    LOGGER.info("idle: active jobs finished, workers and merges drained; exiting")
+                    paused = [
+                        job["job_id"] for job in state["jobs"]
+                        if job.get("setup_status") == "paused"
+                        and any(partition["status"] not in {"merged", "partial"}
+                                for partition in job["partitions"].values())
+                    ]
+                    if paused:
+                        LOGGER.warning("Exiting idle scheduler with jobs paused after session setup failures (%s)",
+                                       ", ".join(paused))
+                    else:
+                        LOGGER.info("idle: active jobs finished, workers and merges drained; exiting")
                     return 0
             time.sleep(poll_seconds)

@@ -104,12 +104,11 @@ def register(
         "backend": spec.backend,
         "backend_args": spec.backend_args,
         "pool": asdict(pool),
-        "pins": operation_pins,
+        "pins": pins,
     }
     if sizes is None:
-        described = run_backend_op(pool, "describe", backend_payload)
+        described = run_backend_op(pool, "describe", {**backend_payload, "pins": operation_pins})
         partition_rows = described["partitions"]
-        session_key = str(described["session_key"])
     else:
         partition_rows = [
             {
@@ -120,8 +119,11 @@ def register(
             }
             for name, size in sizes.items()
         ]
-        backend = backend_class(spec.backend_args, asdict(pool), pins)
-        session_key = backend.session_key()
+
+    if sizes is None and operation_pins == pins:
+        session_key = str(described["session_key"])
+    else:
+        session_key = str(run_backend_op(pool, "session_key", backend_payload)["session_key"])
 
     names = [str(row["name"]) for row in partition_rows]
     if not names or len(names) != len(set(names)):

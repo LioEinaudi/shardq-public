@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import json
-import os
 import shlex
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from ..fs import atomic_output, atomic_write_json
 from . import aihc_client
 from .base import Launcher
 
@@ -96,24 +95,14 @@ class AihcLauncher(Launcher):
             payload["priority"] = str(configured.get("priority", "low"))
 
         workers = self.root / "workers"
-        workers.mkdir(parents=True, exist_ok=True)
         job_file = workers / f"{worker_id}.aihc.json"
-        temporary = job_file.with_name(f"{job_file.name}.tmp-{os.getpid()}")
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(str(temporary), str(job_file))
+        atomic_write_json(job_file, payload)
 
         code_dir = workers / f"{worker_id}.code"
-        code_dir.mkdir(parents=True, exist_ok=True)
         train = code_dir / "train.sh"
-        temporary_train = train.with_name(f"{train.name}.tmp-{os.getpid()}")
-        temporary_train.write_text(
-            f"#!/bin/bash\nset -euo pipefail\n{command}\n", encoding="utf-8"
-        )
-        os.chmod(temporary_train, 0o755)
-        os.replace(str(temporary_train), str(train))
+        with atomic_output(train) as temporary:
+            temporary.write_text(f"#!/bin/bash\nset -euo pipefail\n{command}\n", encoding="utf-8")
+            temporary.chmod(0o755)
 
         return aihc_client.create_job(
             str(job_file),

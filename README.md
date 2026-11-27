@@ -41,9 +41,10 @@ tmux new -d -s shardq 'exec shardq scheduler --launcher volc --exit-when-idle >>
 ```
 
 Use the launcher for your pool (`local`, `volc`, or `aihc`). The scheduler exits
-once unstopped jobs are merged or partial, workers and leases have drained, and
-background merges have finished. Stopped jobs remain unfinished; restart the
-scheduler after resuming them or registering new work. `remain-on-exit off`
+once runnable jobs are merged or partial, workers and leases have drained, and
+background merges have finished. A temporary setup backoff keeps the scheduler
+waiting. Stopped jobs and jobs paused after repeated setup failures can be
+resumed later. Restart the scheduler if it has already exited. `remain-on-exit off`
 closes exited panes; inspect the saved stderr log for failures. Setting it to
 `on` retains every exited pane, including successful runs.
 
@@ -68,6 +69,26 @@ A pool chooses a backend and launcher. Backend-specific values belong in
 `extra`; for example, the lmms backend reads `extra.lmms_root` and
 `extra.column`. See [examples/pools.example.json](examples/pools.example.json)
 for local and placeholder Volc pools.
+
+## Recovery and upgrades
+
+If model loading or another session setup step fails, `shardq status --job JOB`
+shows the job's setup state, failure count and next retry time. ShardQ waits
+`retry.backoff_seconds` (default 300) and pauses that job after
+`retry.max_session_errors` failures (default 3). Other jobs in its pool can
+continue. Fix the environment and run `shardq resume --job JOB` to start a new
+setup budget with the original partition ranges and attempt history.
+
+For an existing ledger, stop the old scheduler and drain old workers, including
+queued submissions, before starting the upgraded writers. Existing pools,
+snapshots, jobs and attempts can be used in place. Workers recompute session
+compatibility, including the actual Script `run_command`, on each claim.
+
+Use a POSIX shared filesystem with coherent cross-host `flock`, symbolic links
+and atomic same-directory file rename. A worker publishes a fully initialized
+lease with one link creation. The scheduler can also recover incomplete leases
+left by earlier versions after a two-TTL grace period. The deployment assumptions
+and recovery rules are in [the design](docs/design.md#ledger-and-state-semantics).
 
 ## Volc
 

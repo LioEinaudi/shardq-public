@@ -15,7 +15,9 @@ description: Use when asked to run, monitor, debug, or extend ShardQ, the filesy
   is authoritative, so a dead scheduler or worker loses nothing. Restarting is always safe.
 - Workers are expected to die (preemption, wall clock, idle exit). Failures with reason
   `preempted`, `lease_expired`, `launcher_terminal` count toward `retry.max_preemptions`;
-  `backend_error`, `validation_error`, `session_error` count toward `retry.max_errors`.
+  `backend_error` and `validation_error` count toward `retry.max_errors`.
+  `session_error` backs off the job and pauses it after `retry.max_session_errors`
+  (default 3). Fix setup and run `shardq resume --job J` for a new setup budget.
   An over-limit shard is bisected until it holds one unit, then quarantined. A partition
   with quarantined units merges as `partial`, never as complete.
 - Every job carries a `protocol_id`. ShardQ never changes protocol identity; it only
@@ -27,7 +29,7 @@ description: Use when asked to run, monitor, debug, or extend ShardQ, the filesy
   many jobs may be registered at once.
 - Each tick submits `min(demand - live, pool.max_workers - live, --max-submits-per-tick)`
   workers, where live counts queued plus running workers and demand is pending,
-  backoff and leased shards; uncut units are never counted, so a worker is only
+  backoff and leased shards of jobs eligible for claims; uncut units are never counted, so a worker is only
   submitted when a shard already exists for it. Volc probe mode additionally keeps at most
   `volc.max_queued` workers waiting in the queue; running workers no longer count. So
   `max_workers` is the GPU ceiling and `max_queued` only bounds unstarted tasks.
@@ -38,12 +40,15 @@ description: Use when asked to run, monitor, debug, or extend ShardQ, the filesy
   (`min_units = max_units = 1`) should set `lookahead` at least as high as the desired
   worker count.
 - Which job a worker serves is decided at claim time, in this order: same partition as
-  its last shard, same `session_key` (model already loaded), higher job `priority`, fewer
+  its last shard, same registered `session_key`, higher job `priority`, fewer
   remaining shards, shards without prior failures, lower start unit. A worker with a
   loaded model keeps draining that model's jobs even when a higher-priority job with a
   different `session_key` appears; only a fresh worker follows priority first. Equal
   priorities interleave. To serialize benchmarks, `shardq stop` the ones that must wait
   or give them distinct priorities.
+- At execution time the worker verifies backend identity and the effective session
+  settings again. A legacy saved key can affect ordering. Script jobs with different
+  commands open different sessions even if their explicit labels match.
 
 ## Preflight, every session
 
@@ -65,7 +70,7 @@ description: Use when asked to run, monitor, debug, or extend ShardQ, the filesy
 ```bash
 export SHARDQ_ROOT=/path/to/ledger            # shared filesystem visible to all workers
 export SHARDQ_POOLS=/path/to/pools.json       # see references/specs.md
-shardq selftest-fs --root "$SHARDQ_ROOT/_selftest"   # once per new filesystem; expect conflicts 0
+shardq selftest-fs --root "$SHARDQ_ROOT/_selftest"   # one-host mkdir probe; expect conflicts 0
 shardq register job.json --dry-run            # validates spec, prints pins, writes nothing
 shardq register job.json                      # lmms backend: add --pin-mode verify to use the tree in place
 mkdir -p "$SHARDQ_ROOT/scheduler/log"
@@ -81,7 +86,8 @@ shardq publish --job <job_id> --out-dir /path/to/new/dir  # optional evidence bu
 - Merged outputs: `<root>/jobs/<job>/merged/<partition>/{results.json,records.jsonl,merge.json}`
   and markers under `<root>/jobs/<job>/markers/<column>/`.
 - `job_id` is permanent. `register` refuses an existing id; to rerun, pick a new id.
-- `--exit-when-idle` exits after all unstopped jobs merge (complete or partial),
+- `--exit-when-idle` waits through temporary setup backoff. It exits after all jobs
+  outside manual STOP or setup pause merge (complete or partial),
   workers and leases drain, and background merges finish. Stopped jobs remain stopped
   and unfinished; resuming or registering more work after exit requires restarting
   the scheduler. Omit this flag only for an intentionally persistent scheduler.
@@ -144,6 +150,10 @@ Run `python -m unittest discover -s tests -v` afterwards.
   Normal `--exit-when-idle` completion does not need a restart until more work arrives.
   Preserve stdout/stderr to files and use `remain-on-exit off` for batch runs.
   Never run two.
+- Upgrade the scheduler and workers together after draining old writers, including
+  queued workers. Keep existing job, pool snapshot and attempt files. Leases now
+  require cross-host `flock` and coherent atomic symlink creation, unlink and rename.
+  Verify these on the actual mount across participating hosts. Keep lock files in place.
 - Never hand-edit or delete `lease/`, `attempts/`, `complete.json`, `failed.json`,
   `quarantine.json`, or `superseded.json`. Use `stop`, `split`, `merge`, or wait for lease
   expiry (`retry.lease_ttl_seconds`; twice that forces expiry regardless of the launcher).

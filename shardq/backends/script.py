@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import List
 
 from ..ledger import atomic_write_json
-from .base import Backend, Partition, RangeResult, validate_unit_ids
+from .base import Backend, Partition, RangeResult, session_fingerprint, validate_unit_ids
 
 
 def _run(command: str, env: dict, label: str) -> subprocess.CompletedProcess:
@@ -78,7 +78,11 @@ class ScriptBackend(Backend):
         ]
 
     def session_key(self) -> str:
-        return str(self.backend_args.get("session_key", "any"))
+        return session_fingerprint(
+            self.name,
+            str(self.backend_args.get("run_command", "")),
+            str(self.backend_args.get("session_key", "any")),
+        )
 
     def open_session(self) -> _ScriptSession:
         command = self.backend_args.get("run_command")

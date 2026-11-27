@@ -294,6 +294,35 @@ class AihcSubmitTest(unittest.TestCase):
 
 
 class RunSchedulerTests(unittest.TestCase):
+    def test_exit_when_idle_drains_replacement_after_late_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = Ledger(root)
+            job = ledger.job_dir("late")
+            atomic_write_json(job / "job.json", {
+                "job_id": "late", "backend": "fake", "pool": "p", "retry": {"lease_ttl_seconds": 5},
+            })
+            atomic_write_json(job / "partitions/p/partition.json", {"name": "p", "size": 1})
+            ledger.cut("late", "p", 1, 1, 10)
+            old = ledger.claim("p", [], {"worker_id": "old"}, None, None, 11)
+            ledger.expire_leases("late", 5, lambda _: False, 25)
+            replacement = ledger.claim("p", [], {"worker_id": "new"}, None, None, 26)
+            records = old.attempt_dir / "records.jsonl"
+            records.write_text('{"unit_id":0}\n', encoding="utf-8")
+            ledger.complete(old, records, 1, 11, 1, {}, 27)
+            ledger.set_partition_status("late", "p", "merged")
+
+            with patch.object(controller.time, "time", return_value=28) as clock:
+                def advance(seconds):
+                    self.assertEqual(clock.return_value, 28)
+                    clock.return_value += seconds
+
+                with patch.object(controller.time, "sleep", side_effect=advance) as sleep:
+                    code = controller.run_scheduler(root, "local", 10, False, True, {"pools": {"p": _pool()}})
+            self.assertEqual(code, 0)
+            sleep.assert_called_once_with(10)
+            self.assertFalse((replacement.shard_dir / "lease").exists())
+
     def setUp(self) -> None:
         self.old_handlers = controller.LOGGER.handlers[:]
         self.old_level = controller.LOGGER.level
