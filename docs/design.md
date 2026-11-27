@@ -53,6 +53,7 @@ The root is always supplied by `--root` or `SHARDQ_ROOT`. Its format is:
 ```text
 jobs/<job>/job.json
 jobs/<job>/setup_epoch.json                  # created by resume
+jobs/<job>/setup.lock
 jobs/<job>/partitions/<partition>/partition.json
 jobs/<job>/partitions/<partition>/partition.lock
 jobs/<job>/partitions/<partition>/shards/<shard>/
@@ -79,10 +80,11 @@ A shard's state follows the first matching condition in this order.
 5. The newest range failure's retry time selects `PENDING_BACKOFF` or `PENDING`.
 
 **Lease publication and release.** Each writer opens the shard's permanent
-`lease.lock` file and takes an exclusive `flock` for the mutation. Claim checks
-the shard again under the lock and creates a fresh attempt directory with an
-audit copy of the owner. While there is no current lease, it prepares the live
-owner and initial Unix heartbeat under the private shard directory
+`lease.lock` file and takes an exclusive `flock` for the mutation. Claim also
+takes the job's `setup.lock`, then rechecks job setup, the partition's
+`max_parallel` limit and shard eligibility before creating a fresh attempt
+directory with an audit copy of the owner. While there is no current lease, it
+prepares the live owner and initial Unix heartbeat under the private shard directory
 `.lease-owner/`. A backend may write its own `heartbeat` file in its attempt
 output directory. Successful creation of the relative symlink
 `lease -> .lease-owner` is the claim's linearization point. An existing
@@ -93,7 +95,9 @@ files under the same lock before publishing its own generation.
 Heartbeats verify the attempt ID under that same lock and atomically replace
 the heartbeat file. For release, the identity check and unlink occur within
 one lock acquisition. Expiry checks launcher liveness outside the lock and
-rechecks the owner and heartbeat under it. Locks have stable inodes across
+tries to acquire it without waiting. A busy lease is left for a later tick,
+so a suspended worker cannot stall expiry of other shards. After acquiring the
+lock, expiry rechecks the owner and heartbeat. Locks have stable inodes across
 lease generations and are released by closing the file descriptor or process
 exit. Legacy physical lease directories use the same lock for removal. An
 unreadable or invalid owner gets a grace period of two TTLs from the latest
@@ -128,16 +132,16 @@ to the CLI.
 
 Upgrade an existing ledger in place after draining all old writers, including
 queued workers. Mixed-version writers are unsupported because old workers
-bypass the shard and partition locks. Old `pool_snapshot` objects with
+bypass the job, shard and partition locks. Old `pool_snapshot` objects with
 top-level `column` and `lmms_root` are normalized when a worker must recover
 configuration from a snapshot. The attempt and job formats accept absent
 setup fields. Old splits, quarantines and completed results retain their state.
 
 ## Worker loop
 
-A worker claims from unstopped jobs matching its pool. Candidate ordering keeps
-partition and session locality, then considers job priority, remaining shards,
-prior failures, and start unit. The registered key still guides that ordering
+A worker claims from unstopped jobs whose setup is ready and whose pool matches.
+Candidate ordering keeps partition and session locality, then considers job
+priority, remaining shards, prior failures, and start unit. The registered key still guides that ordering
 and keys runtime history. The worker independently derives its reuse identity
 from the job's backend and the effective settings captured by the session.
 Script hashes the run command and its optional grouping label, Fake includes
@@ -147,7 +151,9 @@ History for a newly keyed configuration starts from its normal estimate.
 Python retains imported modules across session closes. A worker that already
 loaded a different lmms source pin records `worker_restart`, releases the claim
 and exits. The next worker can load that pin in a fresh interpreter. This
-handoff consumes no retry budget. On first load, importing lmms from outside
+handoff consumes no retry budget. A failure while closing the previous session
+also releases the new claim and retires the worker without charging the next
+job's setup budget. On first load, importing lmms from outside
 the requested root produces a setup error. Keep a verify-mode checkout at its
 registered revision until the job finishes.
 A completed range must cover exactly its absolute
@@ -161,6 +167,11 @@ bisects or quarantines over-limit shards, updates the runtime EMA, maintains
 lookahead cuts, merges terminal partitions, and finally submits workers for
 remaining demand. A non-blocking `flock` on `scheduler/lock` enforces one
 scheduler per ledger.
+
+lmms control operations, including aggregation, run in a fresh subprocess even
+when the pool uses the scheduler's Python executable. Each operation therefore
+imports its own pinned source. The source pin also selects this isolation for
+backends configured through `module:Class`.
 
 A lease can expire after one TTL when the launcher no longer reports a live
 worker, or after two TTLs regardless of launcher state. Heartbeats run through
@@ -179,6 +190,11 @@ The delay is `retry.backoff_seconds` (default 300 seconds). Blocked jobs
 contribute no new worker demand. Workers already dispatched can report more
 failures. Other jobs in the pool continue to supply work.
 
+Claim publication, `session_error` publication and stop/resume share
+`setup.lock`. Operations needing both locks take `lease.lock` first, then
+`setup.lock`; expiry only needs `lease.lock`. A job cannot become blocked
+between a claim's final setup check and its lease publication.
+
 `shardq resume --job JOB` starts a fresh setup epoch and clears a manual STOP.
 Each claim captures its epoch so failures from earlier claims stay in their
 original budget. Missing epochs denote the initial cycle, including earlier
@@ -186,6 +202,8 @@ original budget. Missing epochs denote the initial cycle, including earlier
 `session_errors` and `session_retry_after_unix`. Restarting the scheduler
 reconstructs all three from the ledger. A batch scheduler waits through
 temporary backoff and may exit with paused jobs once workers and leases drain.
+Setup recovery warnings only name jobs with unfinished partitions; historical
+failures in jobs already merged or partial require no resume action.
 
 ## Pool configuration
 

@@ -31,6 +31,15 @@ class SetupDiagnosticsTests(unittest.TestCase):
         claim = self.ledger.claim("p", [job_id], {"worker_id": "worker"}, None, None, now)
         self.ledger.fail(claim, "session_error", True, "model missing", 30, now)
 
+    def add_finished_legacy_job(self, job_id, status, max_session_errors=1):
+        shard = self.add_job(job_id, max_session_errors=max_session_errors)
+        self.setup_failure(job_id, 100)
+        # Older ledgers can have successful work after setup failures exhausted
+        # the job-wide budget introduced by this version.
+        atomic_write_json(shard / "attempts" / "success" / "complete.json",
+                          {"count": 1, "elapsed_seconds": 1, "completed_unix": 101})
+        self.ledger.update_partition(shard.parent.parent / "partition.json", status=status)
+
     def tick(self, now):
         controller.tick(self.root, "local", self.pools,
                         {"max_submits_per_tick": 0, "require_complete": True}, now)
@@ -76,6 +85,7 @@ class SetupDiagnosticsTests(unittest.TestCase):
             self.setup_failure(job_id, 100)
         self.add_job("manual-stop")
         (self.ledger.job_dir("manual-stop") / "STOP").touch()
+        self.add_finished_legacy_job("old-merged", "merged")
         result = subprocess.run([sys.executable, "-m", "shardq", "scheduler", "--root", str(self.root),
                                  "--launcher", "local", "--exit-when-idle"],
                                 capture_output=True, text=True, timeout=10)
@@ -86,3 +96,12 @@ class SetupDiagnosticsTests(unittest.TestCase):
         for job_id in ("load-model", "load-tokenizer"):
             self.assertIn(job_id, exits[0])
         self.assertNotIn("manual-stop", exits[0])
+        self.assertNotIn("old-merged", exits[0])
+
+    def test_finished_jobs_do_not_warn_about_historical_setup_failures(self):
+        for status in ("merged", "partial"):
+            for limit in (1, 2):
+                self.add_finished_legacy_job(f"old-{status}-{limit}", status, limit)
+        state = self.tick(105)
+        self.assertEqual({job["setup_status"] for job in state["jobs"]}, {"backoff", "paused"})
+        self.assertEqual(state["warnings"], [])

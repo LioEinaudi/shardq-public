@@ -437,6 +437,8 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
 
     final_jobs = [ledger.scan_job(job_id, now) for job_id in job_ids]
     for job in final_jobs:
+        if all(partition.status in {"merged", "partial"} for partition in job.partitions.values()):
+            continue
         if job.setup_status == "backoff":
             warnings.append(f"{job.job_id} session setup is in backoff after {job.session_errors} failures. "
                             f"Inspect the session_error attempts. Setup can retry at Unix {job.session_retry_after_unix}.")
@@ -557,7 +559,12 @@ def run_scheduler(
                     for partition in job["partitions"].values()
                 )
                 if complete and not alive and not leased and not state.get("merges_in_flight"):
-                    paused = [job["job_id"] for job in state["jobs"] if job.get("setup_status") == "paused"]
+                    paused = [
+                        job["job_id"] for job in state["jobs"]
+                        if job.get("setup_status") == "paused"
+                        and any(partition["status"] not in {"merged", "partial"}
+                                for partition in job["partitions"].values())
+                    ]
                     if paused:
                         LOGGER.warning("Exiting idle scheduler with jobs paused after session setup failures (%s)",
                                        ", ".join(paused))
