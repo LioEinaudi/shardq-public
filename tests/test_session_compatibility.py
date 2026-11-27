@@ -7,7 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from shardq.backends.base import RangeResult
 from shardq.backends.fake import FakeBackend
@@ -111,6 +111,40 @@ class SessionCompatibilityTests(unittest.TestCase):
     def test_fake_unit_duration_changes_session_key(self):
         self.assertNotEqual(FakeBackend({"unit_seconds": 0}, {}, {}).session_key(),
                             FakeBackend({"unit_seconds": 1}, {}, {}).session_key())
+
+    def test_previous_session_cleanup_failure_releases_next_job_without_charge(self):
+        self.register_job("alpha", "fake", {"unit_seconds": 0})
+        self.register_job("beta", "fake", {"unit_seconds": 0, "poison_units": {"p": []}})
+        job_file = self.ledger.job_dir("beta") / "job.json"
+        spec = read_json(job_file)
+        spec["retry"]["max_session_errors"] = 1
+        atomic_write_json(job_file, spec)
+        close = Mock(side_effect=RuntimeError("previous model cleanup failed"))
+        open_session = FakeBackend.open_session
+
+        def open_with_broken_cleanup(backend):
+            session = open_session(backend)
+            session.close = close
+            return session
+
+        with patch.object(FakeBackend, "open_session", autospec=True,
+                          side_effect=open_with_broken_cleanup) as opened:
+            self.assertEqual(run_worker(self.root, "pool", "w", 60, 0), 0)
+        self.assertEqual(opened.call_count, 1, "beta must wait for a fresh worker")
+        close.assert_called_once_with()
+        self.assertEqual(self.ledger.scan_job("alpha", time.time()).partitions["p"].done, 1)
+        beta = self.ledger.scan_job("beta", time.time())
+        self.assertEqual(beta.session_errors, 0)
+        self.assertFalse(beta.claims_blocked)
+        (shard,) = beta.partitions["p"].shards
+        self.assertEqual((shard.errors, shard.preemptions), (0, 0))
+        self.assertEqual(beta.partitions["p"].pending, 1)
+        (failure,) = self.ledger.job_dir("beta").glob("partitions/p/shards/*/attempts/*/failed.json")
+        self.assertEqual(read_json(failure)["reason"], "worker_restart")
+        self.assertIn("RuntimeError: previous model cleanup failed", read_json(failure)["error"])
+
+        self.run_one_worker()
+        self.assertEqual(self.ledger.scan_job("beta", time.time()).partitions["p"].done, 1)
 
     def test_lmms_key_covers_captured_settings_and_source(self):
         original = LmmsEvalBackend({}, {}, {"lmms_root": "/one"}).session_key()

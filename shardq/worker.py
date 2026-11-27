@@ -163,12 +163,15 @@ def run_worker(
                     if session is None or session_identity != identity:
                         if session is not None:
                             previous_session, session = session, None
-                            previous_session.close()
+                            try:
+                                previous_session.close()
+                            except Exception as exc:
+                                raise WorkerRestartRequired("previous session cleanup failed") from exc
                         session = backend.open_session()
                         session_identity = identity
                 except Exception as exc:
                     if isinstance(exc, WorkerRestartRequired) and session_identity is not None:
-                        ledger.fail(claim, "worker_restart", True, str(exc), 0, time.time())
+                        ledger.fail(claim, "worker_restart", True, traceback.format_exc()[-4000:], 0, time.time())
                         active_claim = None
                         return 0
                     ledger.fail(
