@@ -12,11 +12,17 @@ from uuid import uuid4
 
 
 @contextmanager
-def file_lock(path: Path) -> Iterator[None]:
-    """All contenders must open the same permanent inode on a lock-aware mount."""
+def file_lock(path: Path, *, blocking: bool = True) -> Iterator[bool]:
+    """Yield acquisition status; contenders must share a permanent lock inode."""
     with path.open("a") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        yield
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            if blocking:
+                raise
+            yield False
+            return
+        yield True
 
 
 @contextmanager

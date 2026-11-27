@@ -36,10 +36,14 @@ def _die_before_owner(root):
 
 def _compete(root, worker, barrier, results):
     original = Ledger.scan_job
+    initial_scan = True
 
     def scanned(ledger, job_id, now):
+        nonlocal initial_scan
         view = original(ledger, job_id, now)
-        barrier.wait(timeout=10)
+        if initial_scan:
+            initial_scan = False
+            barrier.wait(timeout=10)
         return view
 
     with patch.object(Ledger, "scan_job", scanned):
@@ -135,18 +139,71 @@ echo '{"unit_id":0}' > "$SHARDQ_OUT_DIR/records.jsonl" """
                 self.assertFalse(self.lease.exists())
                 self.assertEqual(list(self.shard.glob("attempts/*/failed.json")), [])
 
-    def test_competing_processes_with_same_pending_snapshot(self):
-        barrier = multiprocessing.Barrier(3)
+    def test_unreadable_legacy_owner_gets_grace_then_releases_lease(self):
+        self.lease.mkdir()
+        owner_file = self.lease / "owner.json"
+        atomic_write_json(owner_file, {"attempt_id": "old-100", "acquired_unix": 100})
+        created = owner_file.stat().st_mtime
+        original_open = Path.open
+
+        def unreadable(path, *args, **kwargs):
+            if path == owner_file:
+                raise PermissionError("owner is unreadable")
+            return original_open(path, *args, **kwargs)
+
+        with patch.object(Path, "open", unreadable):
+            self.assertEqual(self.expire(created + 11), [])
+            self.assertEqual(self.expire(created + 31), [self.shard_id])
+            self.assertEqual(self.expire(created + 41), [])
+        self.assertFalse(self.lease.exists())
+        self.assertEqual(list(self.shard.glob("attempts/*/failed.json")), [])
+        self.assertIsNotNone(_claim(self.root, "replacement", created + 42))
+
+    def test_expiry_skips_busy_lease_and_continues_other_shards(self):
+        first = _claim(self.root, "first", 100)
+        self.ledger.update_partition(self.shard.parent.parent / "partition.json", size=2)
+        second_id = self.ledger.cut("job", "p", 1, 1, 100)
+        second = _claim(self.root, "second", 100)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            with (self.shard / "lease.lock").open("a") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX)
+                pending = executor.submit(self.expire, 135)
+                try:
+                    expired = pending.result(timeout=2)
+                finally:
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+        self.assertEqual(expired, [second_id])
+        self.assertTrue(self.lease.exists())
+        self.assertFalse((first.attempt_dir / "failed.json").exists())
+        self.assertEqual(read_json(second.attempt_dir / "failed.json")["reason"], "lease_expired")
+        self.assertEqual(self.expire(136), [self.shard_id])
+
+    def competing_claims(self, count):
+        barrier = multiprocessing.Barrier(count)
         results = multiprocessing.Queue()
         processes = [multiprocessing.Process(target=_compete, args=(self.root, str(i), barrier, results))
-                     for i in range(3)]
+                     for i in range(count)]
         for process in processes:
             process.start()
         winners = [result for result in (results.get(timeout=10) for _ in processes) if result]
         for process in processes:
             process.join(timeout=10)
             self.assertEqual(process.exitcode, 0)
+        return winners
+
+    def test_competing_processes_with_same_pending_snapshot(self):
+        winners = self.competing_claims(3)
         self.assertEqual(winners, [read_json(self.lease / "owner.json")["attempt_id"]])
+
+    def test_competing_claims_respect_partition_parallel_limit(self):
+        spec_path = self.ledger.job_dir("job") / "job.json"
+        spec = read_json(spec_path)
+        spec["traits"] = {"p": {"max_parallel": 1}}
+        atomic_write_json(spec_path, spec)
+        self.ledger.update_partition(self.shard.parent.parent / "partition.json", size=2)
+        self.ledger.cut("job", "p", 1, 1, 100)
+        self.assertEqual(len(self.competing_claims(2)), 1)
+        self.assertEqual(self.ledger.scan_job("job", 100).partitions["p"].leased, 1)
 
     def race_at(self, mod, name, is_boundary, first, contender):
         # Stop the first actor at the write/unlink. Let the contender run until
@@ -186,7 +243,8 @@ echo '{"unit_id":0}' > "$SHARDQ_OUT_DIR/records.jsonl" """
             ledger_module, "_atomic_write_text", lambda path: path.name == "heartbeat",
             lambda: self.ledger.heartbeat(claim, 101), lambda: self.expire(130),
         )
-        self.assertEqual(expired, [claim.shard_id])
+        self.assertEqual(expired, [])
+        self.assertEqual(self.expire(130), [claim.shard_id])
         self.assertFalse(self.lease.exists())
 
     def test_release_interleaved_with_replacement_preserves_new_owner(self):
@@ -207,6 +265,8 @@ echo '{"unit_id":0}' > "$SHARDQ_OUT_DIR/records.jsonl" """
             shutil, "rmtree", lambda path: Path(path) == self.lease,
             lambda: self.ledger.fail(claim, "preempted", True, "", 0, 102), replace,
         )
+        self.assertIsNone(replacement)
+        replacement = _claim(self.root, "b", 131)
         self.assertIsNotNone(replacement)
         self.ledger.heartbeat(replacement, 132)
         self.assertEqual(read_json(self.lease / "owner.json")["attempt_id"], replacement.attempt_id)

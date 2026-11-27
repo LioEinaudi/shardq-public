@@ -1,15 +1,18 @@
+import fcntl
 import io
 import json
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stdout
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from shardq import cli, controller, worker
+from shardq import cli, controller, ledger as ledger_module, worker
 from shardq.backends.fake import FakeBackend
 from shardq.ledger import Ledger, atomic_write_json, read_json
 from shardq.register import register
@@ -81,6 +84,69 @@ class SessionRecoveryTest(unittest.TestCase):
         self.assertEqual(self.tick(101)["workers_submitted"], 0)
         self.assertIsNone(Ledger(self.root).claim("p", [], {"worker_id": "new"}, None, None, 109))
         self.assertEqual(self.tick(110)["workers_submitted"], 1)
+
+    def test_stale_selection_cannot_claim_after_job_backoff_or_pause(self):
+        for limit, status in ((3, "backoff"), (1, "paused")):
+            job_id = "blocked-" + status
+            with self.subTest(status=status):
+                self.add_job(job_id, retry={"max_session_errors": limit})
+                scan = self.ledger.scan_job
+                injected = False
+
+                def scan_then_fail(selected_job, now):
+                    nonlocal injected
+                    old = scan(selected_job, now)
+                    if not injected:
+                        injected = True
+                        other = Ledger(self.root)
+                        claim = other.claim("p", [job_id], {"worker_id": "other"}, None, None, now)
+                        other.fail(claim, "session_error", True, "setup failed", 10, now)
+                    return old
+
+                with patch.object(self.ledger, "scan_job", side_effect=scan_then_fail):
+                    claim = self.ledger.claim("p", [job_id], {"worker_id": "stale"}, None, None, 100)
+                self.assertIsNone(claim)
+                self.assertEqual(scan(job_id, 100).setup_status, status)
+                self.assertEqual(list(self.ledger.job_dir(job_id).glob("**/attempts/stale-*")), [])
+
+    def test_session_failure_and_claim_publication_are_serialized(self):
+        self.add_job(retry={"max_session_errors": 1})
+        old = self.ledger.claim("p", ["broken"], {"worker_id": "old"}, None, None, 100)
+        progressed = threading.Event()
+        main = threading.current_thread()
+        flock = fcntl.flock
+        symlink = ledger_module.os.symlink
+        events = []
+
+        def fail():
+            self.ledger.fail(old, "session_error", True, "setup failed", 10, 101)
+            events.append("failure")
+
+        def watch_contention(fd, flags):
+            if threading.current_thread() is not main and flags == fcntl.LOCK_EX:
+                try:
+                    return flock(fd, flags | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    progressed.set()
+            return flock(fd, flags)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = None
+
+            def publish(*args, **kwargs):
+                nonlocal future
+                future = executor.submit(fail)
+                future.add_done_callback(lambda finished: progressed.set())
+                self.assertTrue(progressed.wait(timeout=5))
+                symlink(*args, **kwargs)
+                events.append("lease")
+
+            with patch.object(ledger_module.os, "symlink", publish), patch.object(fcntl, "flock", watch_contention):
+                claim = self.ledger.claim("p", ["broken"], {"worker_id": "new"}, None, None, 101)
+                self.assertIsNotNone(claim)
+                future.result(timeout=5)
+        self.assertEqual(events, ["lease", "failure"])
+        self.assertEqual(self.ledger.scan_job("broken", 101).setup_status, "paused")
 
     def test_pause_is_persistent_and_job_local_then_resume_recovers(self):
         self.add_job(retry={"max_errors": 20, "max_session_errors": 2})
@@ -158,10 +224,14 @@ class SessionRecoveryTest(unittest.TestCase):
     def test_resume_between_selection_and_claim_fences_old_selection(self):
         self.add_job()
         scan = self.ledger.scan_job
+        initial_scan = True
 
         def scan_then_resume(job_id, now):
+            nonlocal initial_scan
             old = scan(job_id, now)
-            self.resume()
+            if initial_scan:
+                initial_scan = False
+                self.resume()
             return old
 
         with patch.object(self.ledger, "scan_job", side_effect=scan_then_resume):

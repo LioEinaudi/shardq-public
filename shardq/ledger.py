@@ -7,6 +7,7 @@ import os
 import shutil
 import time
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -154,12 +155,15 @@ def _read_heartbeat(path: Path) -> Optional[float]:
     try:
         stamp = float(path.read_text(encoding="utf-8").strip())
         return stamp if math.isfinite(stamp) else None
-    except (FileNotFoundError, NotADirectoryError, IsADirectoryError, ValueError):
+    except (FileNotFoundError, NotADirectoryError, IsADirectoryError, PermissionError, ValueError):
         return None
 
 
 def _lease_owner(lease: Path) -> Optional[dict]:
-    owner = read_json(lease / "owner.json")
+    try:
+        owner = read_json(lease / "owner.json")
+    except PermissionError:
+        return None
     if not isinstance(owner, dict):
         return None
     attempt = owner.get("attempt_id")
@@ -316,14 +320,16 @@ class Ledger:
 
     def stop(self, job_id: str) -> None:
         directory = self._registered_job_dir(job_id)
-        _atomic_write_text(directory / "STOP", f"stopped_unix={time.time()}\n")
+        with file_lock(directory / "setup.lock"):
+            _atomic_write_text(directory / "STOP", f"stopped_unix={time.time()}\n")
 
     def resume(self, job_id: str) -> None:
         directory = self._registered_job_dir(job_id)
         # A generation rather than a timestamp also fences failures reported
         # after resume by a worker which already held its claim.
-        atomic_write_json(directory / "setup_epoch.json", uuid.uuid4().hex)
-        (directory / "STOP").unlink(missing_ok=True)
+        with file_lock(directory / "setup.lock"):
+            atomic_write_json(directory / "setup_epoch.json", uuid.uuid4().hex)
+            (directory / "STOP").unlink(missing_ok=True)
 
     def claim(
         self,
@@ -378,11 +384,18 @@ class Ledger:
                      session_key: str, worker: dict, now: Optional[float]) -> Optional[Claim]:
         job_dir = self.job_dir(job.job_id)
         shard_dir = job_dir / "partitions" / partition.name / "shards" / shard.shard_id
-        with file_lock(shard_dir / "lease.lock"):
-            if (job_dir / "STOP").exists() or read_json(job_dir / "setup_epoch.json", "") != job.setup_epoch:
-                return None
+        # Lease -> setup is the shared order with session-error publication.
+        # The job lock makes the final setup check and lease publication atomic.
+        with file_lock(shard_dir / "lease.lock"), file_lock(job_dir / "setup.lock"):
             acquired = time.time() if now is None else now
-            current = self._scan_shard(shard_dir, acquired, job.setup_epoch)
+            latest = self.scan_job(job.job_id, acquired)
+            if latest.claims_blocked or latest.setup_epoch != job.setup_epoch:
+                return None
+            current_partition = latest.partitions[partition.name]
+            traits = (latest.spec.get("traits") or {}).get(partition.name) or {}
+            if current_partition.leased >= int(traits.get("max_parallel", 2 ** 31 - 1)):
+                return None
+            current = next(item for item in current_partition.shards if item.shard_id == shard.shard_id)
             if not _claimable(current, job.spec.get("retry") or {}):
                 return None
             attempt_epoch = int(acquired)
@@ -481,7 +494,9 @@ class Ledger:
         if reason not in FAILURE_REASONS:
             raise ValueError(f"invalid failure reason: {reason}")
         owner = read_json(claim.attempt_dir / "owner.json", {})
-        with file_lock(claim.shard_dir / "lease.lock"):
+        setup_lock = (file_lock(self.job_dir(claim.job_id) / "setup.lock")
+                      if reason == "session_error" else nullcontext())
+        with file_lock(claim.shard_dir / "lease.lock"), setup_lock:
             failed = claim.attempt_dir / "failed.json"
             if not failed.is_file() and not (claim.attempt_dir / "complete.json").is_file():
                 atomic_write_json(failed, {
@@ -567,7 +582,9 @@ class Ledger:
             age = now - last_seen
             if age <= ttl or (age <= 2 * ttl and is_alive(owner)):
                 return False
-        with file_lock(shard_dir / "lease.lock"):
+        with file_lock(shard_dir / "lease.lock", blocking=False) as acquired:
+            if not acquired:
+                return False
             current = _lease_owner(lease)
             if not os.path.lexists(lease) or current != owner:
                 return False
