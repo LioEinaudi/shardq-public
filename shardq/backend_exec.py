@@ -65,9 +65,12 @@ def run_backend_op(pool: PoolSpec, op: str, payload: dict) -> dict:
     envelope.setdefault("backend_args", {})
     envelope.setdefault("pool", asdict(pool))
     envelope.setdefault("pins", {})
-    python = pool.local_python
+    python = pool.local_python or sys.executable
+    lmms_root = (envelope.get("pins") or {}).get("lmms_root")
+    # lmms source pins can change between jobs; sys.path cannot replace cached modules.
     # A virtualenv may symlink its executable to the control interpreter.
-    if not python or os.path.abspath(python) == os.path.abspath(sys.executable):
+    if (not lmms_root and envelope["backend"] != "lmms_eval"
+            and os.path.abspath(python) == os.path.abspath(sys.executable)):
         return execute_backend_op(op, envelope)
     temporary = tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", suffix=".json", prefix="shardq-backend-", delete=False
@@ -79,7 +82,6 @@ def run_backend_op(pool: PoolSpec, op: str, payload: dict) -> dict:
         env = dict(os.environ)
         package_root = Path(__file__).resolve().parent.parent
         paths = [str(package_root)]
-        lmms_root = (envelope.get("pins") or {}).get("lmms_root")
         if lmms_root:
             paths.append(str(lmms_root))
         if env.get("PYTHONPATH"):
