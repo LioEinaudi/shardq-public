@@ -4,13 +4,32 @@ import shlex
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from ..fs import atomic_output, atomic_write_json
+from ..fs import sha256_file, atomic_output, atomic_write_json
 from . import aihc_client
-from .base import Launcher
+from .base import Admission, Launcher
 
 
 class AihcLauncher(Launcher):
     name = "aihc"
+    initial_status = "queued"
+    admission_only_args = ("max_queued", "gpu_cap", "capacity_mode")
+
+    @classmethod
+    def admission(cls, pool, available_slots):
+        args = pool.launcher_args
+        return Admission(units_per_worker=int(args.get("gpu_slots", 1)),
+                         max_queued=int(args.get("max_queued", 0)))
+
+    @classmethod
+    def execution_source(cls, pool):
+        args = pool.launcher_args
+        return {"image": args.get("image"), "flavor": args.get("flavor", args.get("gpu_resource"))}
+
+    def submission_inputs(self) -> dict:
+        path = self.pool.launcher_args.get("aihc_config")
+        if not path:
+            return {}
+        return {"config_sha256": sha256_file(Path(path))}
 
     def _entrypoint(self, env: Dict[str, str]) -> str:
         combined = {str(key): str(value) for key, value in self.pool.env.items()}
@@ -31,7 +50,7 @@ class AihcLauncher(Launcher):
         self, worker_id: str, worker_argv: List[str], env: Dict[str, str]
     ) -> str:
         del worker_argv
-        configured = self.pool.aihc
+        configured = self.pool.launcher_args
         for key in ("pool_id", "queue_id", "image", "datasources"):
             if key not in configured:
                 raise ValueError(
@@ -115,7 +134,7 @@ class AihcLauncher(Launcher):
         )
 
     def status(self, handle: str) -> str:
-        configured = self.pool.aihc
+        configured = self.pool.launcher_args
         status = aihc_client.get_job_status(
             handle,
             str(configured["pool_id"]),
@@ -130,7 +149,7 @@ class AihcLauncher(Launcher):
         return "queued"
 
     def kill(self, handle: str) -> None:
-        configured = self.pool.aihc
+        configured = self.pool.launcher_args
         aihc_client.stop_job(
             handle,
             str(configured["pool_id"]),

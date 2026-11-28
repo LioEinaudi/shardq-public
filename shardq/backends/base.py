@@ -5,7 +5,7 @@ import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Protocol
+from typing import Dict, List, Optional, Protocol, Tuple
 
 
 class RangeValidationError(RuntimeError):
@@ -73,6 +73,25 @@ class Backend(ABC):
         """
         return cls.pins(pool, root, job_id, pin_mode)
 
+    @classmethod
+    def control_pythonpath(cls, pool: "PoolSpec", pins: dict) -> Optional[Tuple[str, ...]]:
+        """None allows in-process control operations with the same interpreter.
+
+        Return a tuple of import roots (possibly empty) to use a fresh process
+        for describe, session_key and merge. An alternate local_python always
+        runs in its own process.
+        """
+        return None
+
+    @classmethod
+    def report_metadata(cls, job_spec: dict) -> dict:
+        """Optional JSON metadata for result and publication reports."""
+        return {}
+
+    def preview_describe(self) -> List[Partition]:
+        """Describe available inputs during register --dry-run without creating resources."""
+        return self.describe()
+
     @abstractmethod
     def describe(self) -> List[Partition]:
         raise NotImplementedError
@@ -93,6 +112,12 @@ class Backend(ABC):
     @abstractmethod
     def merge(self, partition: Partition, records: List[dict], out_dir: Path, meta: dict) -> dict:
         raise NotImplementedError
+
+    def merge_file(self, partition: Partition, records_file: Path, out_dir: Path, meta: dict) -> dict:
+        """Aggregate the published, coverage-checked JSONL. Existing backends receive a list."""
+        with records_file.open(encoding="utf-8") as handle:
+            records = [json.loads(line) for line in handle if line.strip()]
+        return self.merge(partition, records, out_dir, meta)
 
     def traits(self, partition: str) -> dict:
         return {}

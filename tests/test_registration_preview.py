@@ -7,7 +7,10 @@ import textwrap
 import unittest
 import venv
 from pathlib import Path
+from unittest.mock import patch
 
+from shardq.backend_exec import run_backend_op
+from shardq.spec import pool_from_dict
 from shardq.backends.lmms_eval import LmmsEvalBackend
 
 
@@ -79,6 +82,35 @@ class RegistrationPreviewTests(unittest.TestCase):
             self.assertEqual(str(pinned), job["pins"]["lmms_root"])
             self.assertTrue(pinned.is_dir())
             self.assertEqual(preview["session_key"], expected)
+
+    def test_external_backend_can_isolate_imports_in_control_operations(self):
+        (self.base / "catalog_backend.py").write_text(textwrap.dedent("""
+            import os
+            from shardq.backends.fake import FakeBackend
+
+            class CatalogBackend(FakeBackend):
+                @classmethod
+                def control_pythonpath(cls, pool, pins):
+                    return (pins["catalog_source"],)
+
+                def session_key(self):
+                    import catalog_input
+                    return f"{os.getpid()}:{catalog_input.REVISION}"
+        """))
+        pool = pool_from_dict("p", {"launcher": "local", "backend": "catalog_backend:CatalogBackend"})
+        paths = [str(self.base), os.environ.get("PYTHONPATH", "")]
+        with patch.dict(os.environ, PYTHONPATH=os.pathsep.join(paths)), \
+                patch.object(sys, "path", [str(self.base), *sys.path]):
+            for revision in ("alpha", "beta"):
+                source = self.base / revision
+                source.mkdir()
+                (source / "catalog_input.py").write_text(f"REVISION = {revision!r}\n")
+                result = run_backend_op(pool, "session_key", {"pins": {"catalog_source": str(source)}})
+                pid, token = result["session_key"].split(":")
+                self.assertNotEqual(int(pid), os.getpid())
+                self.assertEqual(token, revision)
+        self.assertNotIn("catalog_input", sys.modules)
+        self.addCleanup(sys.modules.pop, "catalog_backend", None)
 
     def test_backend_constructor_uses_pool_environment_with_and_without_sizes(self):
         # On POSIX venv/bin/python can point at the control interpreter while

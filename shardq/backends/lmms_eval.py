@@ -11,21 +11,11 @@ from typing import List, Optional, Tuple
 
 from ..ledger import atomic_write_json
 from ..spec import PoolSpec
+from .lmms_reports import LmmsReports, _public_scalars
 from .base import (
     Backend, Partition, RangeResult, RangeValidationError, WorkerRestartRequired,
     session_fingerprint, validate_unit_ids,
 )
-
-
-def _public_scalars(metrics: dict) -> dict:
-    result = {}
-    for key, value in metrics.items():
-        lower = str(key).lower()
-        if key == "alias" or "stderr" in lower or lower.startswith("submission"):
-            continue
-        if isinstance(value, (int, float, str, bool)):
-            result[str(key)] = value
-    return result
 
 
 class _LmmsSession:
@@ -131,7 +121,7 @@ class _LmmsSession:
         self.task_manager = None
 
 
-class LmmsEvalBackend(Backend):
+class LmmsEvalBackend(LmmsReports, Backend):
     name = "lmms_eval"
     _session_source: Optional[Tuple[Path, Optional[str]]] = None
 
@@ -330,6 +320,20 @@ class LmmsEvalBackend(Backend):
         outputs = get_task_list(get_task_dict(matched, task_manager=manager))
         return manager, outputs
 
+    @classmethod
+    def control_pythonpath(cls, pool: PoolSpec, pins: dict) -> Tuple[str, ...]:
+        # Cached modules from another pinned revision cannot be replaced by changing sys.path.
+        root = pins.get("lmms_root")
+        return (str(root),) if root else ()
+
+    def preview_describe(self) -> List[Partition]:
+        if self.pins.get("pin_mode") != "worktree":
+            return self.describe()
+        # The future worktree may not exist. Inspect the source checkout while
+        # retaining the final worktree path for this job's effective session key.
+        preview = dict(self.pins, lmms_root=self.pins["lmms_source_root"])
+        return type(self)(self.backend_args, self.pool, preview).describe()
+
     def describe(self) -> List[Partition]:
         if not self.tasks:
             raise ValueError("lmms_eval backend requires backend_args.tasks")
@@ -479,11 +483,8 @@ class LmmsEvalBackend(Backend):
             records_path = shard.get("records_file")
             if not raw_path or not records_path or not Path(raw_path).is_file():
                 continue
-            shard_rows = [
-                json.loads(line)
-                for line in Path(records_path).read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
+            with Path(records_path).open(encoding="utf-8") as stream:
+                shard_rows = [json.loads(line) for line in stream if line.strip()]
             # Public scalars never include stderr, so skip the bootstrap and reuse
             # the task object: a full-size partition has hundreds of shards.
             _, shard_metrics, _ = self._aggregate_rows(

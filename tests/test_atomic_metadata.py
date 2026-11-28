@@ -39,6 +39,40 @@ class AtomicMetadataTests(unittest.TestCase):
             self.assertEqual(read_json(path), {"old": True})
             self.assertEqual(list(path.parent.iterdir()), [path])
 
+    def test_history_cache_tracks_late_and_replaced_attempts_and_rebuilds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = Ledger(root)
+            job = ledger.job_dir("j")
+            partition = job / "partitions" / "p"
+            atomic_write_json(job / "job.json", {"job_id": "j", "backend": "fake", "pool": "p"})
+            atomic_write_json(partition / "partition.json", {"name": "p", "size": 1})
+            shard = ledger.cut("j", "p", 1, 1, 1)
+            attempts = partition / "shards" / shard / "attempts"
+            cache = {}
+
+            def complete(name, finished, elapsed):
+                atomic_write_json(attempts / name / "complete.json",
+                                  {"count": 1, "completed_unix": finished, "elapsed_seconds": elapsed})
+
+            def update():
+                _update_history(root, [ledger.scan_job("j", 50)], 50, [], cache)
+                return read_json(root / "history.json")["fake::p"]
+
+            complete("first", 20, 4)
+            complete("last", 40, 20)
+            self.assertEqual(update()["unit_seconds"], 12)
+            with patch("shardq.controller.update_history", side_effect=AssertionError("unchanged EMA rebuilt")):
+                self.assertEqual(update()["samples"], 2)
+            complete("replay", 30, 12)
+            self.assertEqual(update()["unit_seconds"], 14)
+            complete("last", 40, 40)
+            self.assertEqual(update()["unit_seconds"], 24)
+            expected = update()
+            cache.clear()
+            (root / "history.json").unlink()
+            self.assertEqual(update(), expected)
+
     def test_history_update_during_merge_keeps_estimate_and_status(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

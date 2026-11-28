@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from shardq.backend_exec import run_backend_op
 from shardq.backends.lmms_eval import _LmmsSession
-from shardq.cli import lmms_merge_check
+from shardq.cli import _publish, lmms_merge_check
 from shardq.ledger import Ledger, atomic_write_json
 from shardq.merge import merge_partition
 from shardq.spec import pool_from_dict
@@ -101,7 +101,14 @@ class LmmsSourceIsolationTests(unittest.TestCase):
                         result = json.loads(Path(merged["result_file"]).read_text())
                         scores.append(result["results"]["task"]["score,none"])
                         checks.append(merged["selfcheck"])
-                        self.assertEqual(json.loads(Path(merged["marker_file"]).read_text())["status"], "complete")
+                        marker = json.loads(Path(merged["marker_file"]).read_text())
+                        self.assertEqual(marker["status"], "complete")
+                        self.assertEqual(marker["schema_version"], 1)
+                        self.assertEqual(marker["generation_kwargs"], {})
+                        self.assertIn("canonical_source_proof", marker)
+                        exported = _publish(root, job_id, root / f"export-{factor}")
+                        self.assertEqual(exported["canonical_lmms_root"], str(source))
+                        self.assertEqual(exported["source_revisions"]["canonical_lmms_tree"], str(factor))
                         described = run_backend_op(pool, "describe", {"backend_args": args, "pins": pins})
                         sizes.append(described["partitions"][0]["size"])
                     self.assertEqual(scores, [1, 10])

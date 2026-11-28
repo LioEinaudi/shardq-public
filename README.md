@@ -1,7 +1,8 @@
 # ShardQ
 
-ShardQ is a filesystem-backed scheduler for cutting benchmark partitions into
-short, retryable ranges. Its core has no third-party runtime dependencies.
+ShardQ runs recoverable offline batches on a shared POSIX filesystem. It cuts
+known-size partitions into retryable integer ranges, manages leases and checks
+the merged output. A backend supplies the work and a launcher runs workers. Its core has no third-party runtime dependencies.
 `lmms-eval` is an optional backend loaded only when that backend runs.
 
 ## Install
@@ -14,6 +15,21 @@ shardq --help
 ```
 
 Python 3.9 or newer is required.
+
+## Run a batch script
+
+The [manifest example](examples/manifest_script/) computes file information for
+each manifest entry with the Python standard library. A Script job supplies
+partition sizes (or a discovery command) and a range command. Each invocation
+writes one JSON object per assigned index to `$SHARDQ_OUT_DIR/records.jsonl`.
+The default merge publishes the verified records and a `results.json` summary in
+`jobs/<job>/merged/<partition>/`. It reports record count, completed unique
+units, missing indices and the records SHA-256. A terminal partition with zero
+valid records publishes empty JSONL and reports every index missing.
+
+Set `merge_command` for domain-specific aggregation. For a model that should
+stay loaded across ranges, use a Python Backend session. Script starts a new
+subprocess for every range.
 
 ## Five-minute fake demo
 
@@ -40,7 +56,10 @@ mkdir -p "$SHARDQ_ROOT/scheduler/log"
 tmux new -d -s shardq 'exec shardq scheduler --launcher volc --exit-when-idle >>"$SHARDQ_ROOT/scheduler/log/stdout.log" 2>>"$SHARDQ_ROOT/scheduler/log/stderr.log"' \; set-option -t shardq:0 remain-on-exit off
 ```
 
-Use the launcher for your pool (`local`, `volc`, or `aihc`). The scheduler exits
+Omit `--launcher` to serve all configured pools with one scheduler. An explicit
+`--launcher NAME` limits scheduling to pools using that exact alias or
+`module:Class`. Older releases defaulted to Volc. Add `--launcher volc` to
+existing unattended commands that should serve only Volc pools. The scheduler exits
 once runnable jobs are merged or partial, workers and leases have drained, and
 background merges have finished. A temporary setup backoff keeps the scheduler
 waiting. Stopped jobs and jobs paused after repeated setup failures can be
@@ -79,16 +98,53 @@ shows the job's setup state, failure count and next retry time. ShardQ waits
 continue. Fix the environment and run `shardq resume --job JOB` to start a new
 setup budget with the original partition ranges and attempt history.
 
+**Interrupted worker submissions.** Before contacting a launcher, the scheduler
+records a worker ID and reserves capacity in `workers/<worker_id>.json`.
+Restart the scheduler with the same ledger, pools file and provider account.
+Keep the deployed package path, interpreter, entry scripts and worker environment
+stable when recovering recorded requests. A changed execution fingerprint
+requires inspection of the original request.
+It resumes unused intents and reconciles calls that may have reached the
+platform. An unresolved request keeps its pool slot and keeps
+`--exit-when-idle` waiting. A worker may start and renew leases while its
+submit acknowledgement is still in flight.
+
+`shardq status --json` shows the request ID, submission state, observed
+worker starts, errors, and the next reconciliation time. Linux local workers
+can be identified from their startup receipts. Volc and AIHC currently need
+operator evidence when the create acknowledgement is lost. Inspect the
+original queue/account and task history, including finished tasks. Stop the
+scheduler before recording a verified outcome, for example:
+
+```bash
+shardq resolve-submission --worker-id "$WORKER_ID" --handle "$HANDLE" --evidence "$PROVIDER_EVIDENCE"
+```
+
+Use `--not-created` only with positive evidence that creation was rejected
+and no call can still create the task. Use `--terminal` when every possible
+matching task has finished. For multiple matches, binding one requires
+`--terminal-match HANDLE` for each other verified terminal task and supporting
+evidence. Restart the scheduler after resolution. A temporarily empty listing
+or missing worker heartbeat leaves the reservation in place.
+[Submission states, resource accounting and operator recovery](docs/design.md#worker-submission-recovery)
+
 For an existing ledger, stop the old scheduler and drain old workers, including
 queued submissions, before starting the upgraded writers. Existing pools,
 snapshots, jobs and attempts can be used in place. Workers recompute session
 compatibility, including the actual Script `run_command`, on each claim.
+Legacy worker rows with a handle continue to be polled. Before cutover,
+reconcile any old cloud calls that may have created a task without recording
+a handle. The new protocol starts with requests created by the upgraded scheduler.
 
 Use a POSIX shared filesystem with coherent cross-host `flock`, symbolic links
 and atomic same-directory file rename. A worker publishes a fully initialized
 lease with one link creation. The scheduler can also recover incomplete leases
 left by earlier versions after a two-TTL grace period. The deployment assumptions
 and recovery rules are in [the design](docs/design.md#ledger-and-state-semantics).
+
+Finished batches can keep their ledger at its original absolute path and use a
+fresh root for the next batch. The retained ledger stays available for status
+and publication. [Draining and retaining a batch](docs/archiving.md)
 
 ## Volc
 
@@ -123,6 +179,17 @@ shardq lmms-merge-check \
 
 ## Extension points
 
+[Adapter contract and compatibility](docs/extensions.md) ·
+[Python Backend with a reusable session](examples/python_backend/) ·
+[External Launcher](examples/external_launcher/)
+
+New registrations freeze backend reporting metadata alongside source pins.
+New jobs write version 2 markers and `run.json` with common fields for every
+backend and optional backend reporting fields. lmms retains its original
+top-level marker parameters, revision and import proof. Jobs registered before
+this change still export version 1 markers and runs. The ledger, worker,
+attempt and pool formats accept the previous files in place.
+
 A backend subclasses `shardq.backends.base.Backend`, implements the existing
 describe/session/validate/merge contract, and may implement the class-level
 `pins` hook. Select it with `module:Class` in a pool. The built-in `script`
@@ -130,7 +197,13 @@ backend is convenient for command-line adapters.
 
 A cloud launcher subclasses `shardq.launchers.base.Launcher` and implements
 `submit`, `status`, and `kill`; implement `capacity_slots` when the cloud
-has auditable capacity. Add its name to `shardq.launchers.get_launcher`.
+has auditable capacity. A launcher with complete request history can implement
+`lookup_submission` for automatic recovery. Set `launcher` to the importable `module:Class` and put its options in
+`launcher_args`. Legacy `volc` and `aihc` blocks are also accepted. When both
+forms specify options for the selected launcher they must agree.
+[Runnable external launcher](examples/external_launcher/)
+
+[Local performance measurements and reproduction](docs/performance.md)
 
 ## Agent skill
 

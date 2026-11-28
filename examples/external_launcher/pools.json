@@ -1,0 +1,10 @@
+{
+  "pools": {
+    "cpu": {
+      "backend": "fake",
+      "launcher": "threaded_local:ThreadedLocal",
+      "launcher_args": {"threads_per_worker": 2},
+      "worker_idle_exit_seconds": 1
+    }
+  }
+}

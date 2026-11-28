@@ -44,7 +44,7 @@ launcher no longer reports a live worker, or unconditionally after two TTLs.
 - `fake` (tests and demos): `partitions` `{name: size}`, `unit_seconds` (default 0.05),
   `poison_units` `{partition: [unit_id, ...]}`.
 - `script` (any command line, see `script-backend.md`): `partitions` or
-  `describe_command`, `run_command`, `merge_command`, optional `session_key`.
+  `describe_command`, `run_command`, optional `merge_command` and `session_key`.
 - `lmms_eval`: `tasks` (list; groups expand to leaf tasks, one partition per leaf),
   `model`, `model_args`, `gen_kwargs`, `batch_size` (default 1), `force_simple`
   (default false), `bootstrap_iters` (default 100000). Ranges run through
@@ -61,9 +61,10 @@ launcher no longer reports a live worker, or unconditionally after two TTLs.
 |---|---|---|---|
 | `backend` | string | required | built-in name or `module:Class` |
 | `entry` | string | "" | absolute path of the container entry script; Volc only |
-| `launcher` | string | required | `local` or `volc` |
+| `launcher` | string | required | `local`, `volc`, `aihc` or `module:Class` |
 | `volc` | object | {} | see below |
 | `env` | object | {} | exported into the worker environment |
+| `launcher_args` | object | {} | options for the selected launcher |
 | `local_python` | string | null | interpreter for describe and merge on the control host |
 | `max_workers` | int | 1 | live workers per pool |
 | `worker_max_wall_seconds` | int | 14400 | worker wall clock; Volc deadline is this plus 1800 |

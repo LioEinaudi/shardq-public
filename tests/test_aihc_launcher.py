@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -10,6 +11,7 @@ from unittest.mock import patch
 from shardq.launchers import get_launcher
 from shardq.launchers.aihc import AihcLauncher
 from shardq.spec import pool_from_dict
+from shardq.submission import fingerprint
 
 
 DATASOURCES = [
@@ -35,6 +37,22 @@ def _pool():
 
 
 class AihcLauncherTest(unittest.TestCase):
+    def test_same_path_aihc_config_change_alters_submission_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pool = _pool()
+            launcher = AihcLauncher(root, pool, Path("/package"))
+            with patch.object(Path, "read_bytes", side_effect=AssertionError("implicit config read")):
+                self.assertEqual(launcher.submission_inputs(), {})
+            config = root / "client.conf"
+            pool.aihc["aihc_config"] = str(config)
+            config.write_bytes(b"account: first")
+            inputs = launcher.submission_inputs()
+            before = fingerprint(pool, inputs, ([], {}))
+            config.write_bytes(b"account: other")
+            self.assertNotEqual(before, fingerprint(pool, launcher.submission_inputs(), ([], {})))
+            self.assertEqual(inputs, {"config_sha256": hashlib.sha256(b"account: first").hexdigest()})
+
     def test_submit_writes_cli_v1_json_and_code(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch(
             "shardq.launchers.aihc_client.create_job", return_value="job-a1"

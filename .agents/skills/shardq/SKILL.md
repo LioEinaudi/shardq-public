@@ -11,8 +11,9 @@ description: Use when asked to run, monitor, debug, or extend ShardQ, the filesy
   ticks every N seconds (cut, expire leases, bisect, merge, submit workers); stateless
   `shardq worker`s claim contiguous unit ranges from a shared-filesystem ledger, run them
   through a backend, and write one `records.jsonl` per attempt.
-- Truth is the ledger directory. Every tick re-derives state from files; nothing in memory
-  is authoritative, so a dead scheduler or worker loses nothing. Restarting is always safe.
+- The ledger records each worker request before the launcher call. Restart the scheduler
+  on the same root to recover its reservations. If the platform may have created a task,
+  ShardQ keeps its place until lookup or a verified operator decision resolves the outcome.
 - Workers are expected to die (preemption, wall clock, idle exit). Failures with reason
   `preempted`, `lease_expired`, `launcher_terminal` count toward `retry.max_preemptions`;
   `backend_error` and `validation_error` count toward `retry.max_errors`.
@@ -27,12 +28,13 @@ description: Use when asked to run, monitor, debug, or extend ShardQ, the filesy
 
 - Caps are per pool and shared by every job registered on that pool. Nothing limits how
   many jobs may be registered at once.
-- Each tick submits `min(demand - live, pool.max_workers - live, --max-submits-per-tick)`
-  workers, where live counts queued plus running workers and demand is pending,
-  backoff and leased shards of jobs eligible for claims; uncut units are never counted, so a worker is only
-  submitted when a shard already exists for it. Volc probe mode additionally keeps at most
-  `volc.max_queued` workers waiting in the queue; running workers no longer count. So
-  `max_workers` is the GPU ceiling and `max_queued` only bounds unstarted tasks.
+- `pool.max_workers` covers running, queued and unresolved submissions. Eligible
+  pending, backoff and leased shards supply demand. An uncut range or a job blocked
+  by STOP, setup pause or setup backoff adds no demand. The scheduler rechecks demand
+  and caps before dispatching saved intents. Cloud queue limits also count submissions
+  with unknown outcomes or status. A conflict with several known handles reserves
+  capacity for each. Volc audit accounts for unresolved GPU reservations in the
+  original queue and creator's budget, including reservations made by other pools.
 - Each tick cuts at most `min(lookahead - pending - backoff, --max-cuts-per-tick)`
   shards per partition while below lookahead, subject to remaining units and
   `shard.limit_units`. `--max-cuts-per-tick` defaults to 64, so `lookahead` also
@@ -88,7 +90,7 @@ shardq publish --job <job_id> --out-dir /path/to/new/dir  # optional evidence bu
 - `job_id` is permanent. `register` refuses an existing id; to rerun, pick a new id.
 - `--exit-when-idle` waits through temporary setup backoff. It exits after all jobs
   outside manual STOP or setup pause merge (complete or partial),
-  workers and leases drain, and background merges finish. Stopped jobs remain stopped
+  workers, unresolved submissions and leases drain, and background merges finish. Stopped jobs remain stopped
   and unfinished; resuming or registering more work after exit requires restarting
   the scheduler. Omit this flag only for an intentionally persistent scheduler.
 
@@ -105,9 +107,17 @@ Order of checks when something looks stuck:
    '#{session_name} #{pane_id} #{pane_dead} #{pane_dead_status} #{remain-on-exit}'`.
    Before removing a dead pane, capture its output and verify it is still dead;
    use its pane ID to avoid closing other windows. Check custom `tmux -S` sockets too.
-2. `warnings` and `pool_backoff` in `state.json`: a failed submit backs a pool off 300 s.
-3. Workers table in `shardq status`: `queued` on Volc means waiting for idle GPUs. `terminal:*` rows are normal
-   after preemption or wall clock; the scheduler resubmits while demand exists.
+2. Read `warnings` and `pool_backoff` in `state.json`. In `shardq status --json`, check
+   each affected worker's `submission_state`, diagnostic and `reconcile_after_unix`.
+   `uncertain` keeps its reservation across restarts. Verify the task in the platform's
+   history using the original request ID, pool and submission time. For `conflict`,
+   inspect every recorded candidate and the original pool settings. Binding one
+   of several matches requires a `--terminal-match` for each other verified
+   terminal task and evidence for the decision. Use the
+   `resolve-submission` procedure in `references/cli.md` for a verified outcome.
+3. `queued` on Volc means the task is waiting for idle GPUs. `started_count` counts
+   worker startup receipts, which can appear before a cloud handle is available.
+   `terminal:*` is expected after preemption or wall-clock expiry.
 4. Per-shard detail: `shardq status --job J --json`, then read
    `attempts/<attempt>/failed.json` (`reason`, `error`) for the shard. Recipes in
    `references/ledger.md`.
@@ -120,8 +130,8 @@ Order of checks when something looks stuck:
 Any benchmark that can run a contiguous index range from a command line works through the
 built-in `script` backend without writing Python: `run_command` gets
 `SHARDQ_PARTITION`, `SHARDQ_START`, `SHARDQ_COUNT`, `SHARDQ_OUT_DIR` and must write
-`records.jsonl` with integer `unit_id`s covering exactly that range; `merge_command`
-turns the deduplicated records into `results.json`. Full contract and a worked example:
+`records.jsonl` with integer `unit_id`s covering exactly that range. The default summary records coverage and artifact identity. Optional `merge_command`
+produces a custom `results.json`. Full contract and a worked example:
 `references/script-backend.md`. When model loading dominates, write a Python `Backend`
 whose `open_session` loads once per worker (`docs/design.md`, "Adding a backend").
 
@@ -140,8 +150,7 @@ whose `open_session` loads once per worker (`docs/design.md`, "Adding a backend"
 New backend: subclass `shardq.backends.base.Backend` (`describe`, `session_key`,
 `open_session`, `validate_range`, `merge`, optional class-level `pins`), reference it as
 `module:Class` in the pool. New cloud: subclass `shardq.launchers.base.Launcher`
-(`submit`, `status`, `kill`, optional `capacity_slots`) and add it to
-`shardq.launchers.get_launcher`. Keep imports lazy so `import shardq` stays dependency-free.
+(`submit`, `status`, `kill`, optional `capacity_slots`) and select it by `module:Class` in the pool. Keep imports lazy so `import shardq` stays dependency-free.
 Run `python -m unittest discover -s tests -v` afterwards.
 
 ## Hard rules

@@ -29,6 +29,7 @@ class SessionRecoveryTest(unittest.TestCase):
         pool = pool_from_dict("p", {"launcher": "local", "backend": "fake"})
         self.pools = {"p": pool}
         self.launcher = Mock()
+        self.launcher.submission_inputs.return_value = {}
         self.launcher.status.return_value = "terminal:exit"
         self.launcher.capacity_slots.return_value = None
         self.launcher.submit.side_effect = lambda worker_id, *args: worker_id

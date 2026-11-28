@@ -6,7 +6,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
-from .ledger import Ledger, ShardState, read_json
+from .ledger import Ledger, ShardState
+from .submission import worker_records
 
 
 def _serialize_job(job) -> dict:
@@ -24,10 +25,11 @@ def render_status(root: Path, job_id: Optional[str], as_json: bool) -> str:
     job_ids = [job_id] if job_id else ledger.list_jobs()
     jobs = [_serialize_job(ledger.scan_job(value, time.time())) for value in job_ids]
     workers = []
-    for path in sorted((root / "workers").glob("*.json")):
-        payload = read_json(path, {})
-        if isinstance(payload, dict) and payload.get("worker_id") and payload.get("launcher"):
-            workers.append(payload)
+    for path, worker in worker_records(root):
+        worker["started_count"] = sum(1 for _ in path.with_suffix(".starts").glob("*.json"))
+        if "submission_state" not in worker:
+            worker["submission_state"] = "terminal" if str(worker.get("last_status")).startswith("terminal:") else "legacy"
+        workers.append(worker)
     if as_json:
         return json.dumps({"jobs": jobs, "workers": workers}, ensure_ascii=False, indent=2)
     lines = []
@@ -60,12 +62,13 @@ def render_status(root: Path, job_id: Optional[str], as_json: bool) -> str:
             )
         lines.append("")
     lines.append("Workers")
-    lines.append("worker_id\tpool\tlauncher\thandle\tstatus")
+    lines.append("worker_id\tpool\tlauncher\thandle\tstatus\tsubmission_state\tstarted_count\treconcile_after_unix\tdiagnostic")
     for worker in workers:
         lines.append(
             "\t".join(
                 str(worker.get(key, ""))
-                for key in ("worker_id", "pool", "launcher", "handle", "last_status")
-            )
+                for key in ("worker_id", "pool", "launcher", "handle", "last_status",
+                            "submission_state", "started_count", "reconcile_after_unix")
+            ) + "\t" + str(worker.get("submission_error") or worker.get("status_error") or "")
         )
     return "\n".join(lines).rstrip() + "\n"

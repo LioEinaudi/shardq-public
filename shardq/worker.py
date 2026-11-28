@@ -6,13 +6,15 @@ import socket
 import threading
 import time
 import traceback
+import uuid
 from contextlib import contextmanager
-from dataclasses import asdict
 from pathlib import Path
 from typing import List, Optional
 
 from .backends import get_backend
 from .backends.base import RangeValidationError, WorkerRestartRequired
+from .fs import atomic_write_json
+from .launchers import get_launcher
 from .ledger import Claim, Ledger, ShardState, read_json
 from .spec import PoolSpec, load_pools, pool_from_dict, resolve_pools_path
 
@@ -59,13 +61,47 @@ def _next_estimate(ledger: Ledger, pool: str, job_ids: List[str], now: float) ->
     return min(estimates) if estimates else None
 
 
-def _identity(root: Path, pool: PoolSpec, worker_id: str) -> dict:
+def _identity(root: Path, pool: PoolSpec, worker_id: str) -> Optional[dict]:
     record = read_json(root / "workers" / f"{worker_id}.json", {})
+    handle = record.get("handle")
+    request_id = os.environ.get("SHARDQ_REQUEST_ID")
+    if request_id:
+        if (record.get("request_id") != request_id or
+                record.get("submission_state") not in {"submitting", "uncertain", "confirmed"}):
+            return None
+    else:
+        handle = handle or os.environ.get("SHARDQ_HANDLE")
     return {
         "worker_id": worker_id,
         "launcher": str(record.get("launcher") or os.environ.get("SHARDQ_LAUNCHER") or pool.launcher),
-        "handle": str(record.get("handle") or os.environ.get("SHARDQ_HANDLE") or ""),
+        "handle": str(handle or ""),
     }
+
+
+def _record_start(root: Path, pool: PoolSpec, worker_id: str) -> None:
+    request_id = os.environ.get("SHARDQ_REQUEST_ID")
+    workers = root / "workers"
+    record = read_json(workers / f"{worker_id}.json", {})
+    if not request_id and not record.get("request_id"):
+        return  # Direct worker or a legacy launcher.
+    if (not request_id or request_id != worker_id or worker_id in {".", ".."}
+            or Path(worker_id).name != worker_id or record.get("worker_id") != worker_id
+            or record.get("request_id") != request_id or record.get("pool") != pool.name
+            or record.get("launcher") != pool.launcher):
+        raise ValueError(f"worker {worker_id!r} does not match its submission request")
+
+    receipt = {
+        "worker_id": worker_id, "request_id": request_id, "pool": pool.name,
+        "launcher": pool.launcher, "host": socket.gethostname(), "pid": os.getpid(),
+        "started_unix": time.time(),
+    }
+    for key, value in get_launcher(pool.launcher).startup_receipt().items():
+        if key in receipt:
+            raise ValueError(f"launcher receipt cannot replace identity field {key!r}")
+        receipt[key] = value
+    # Each process owns one receipt. A slow submit acknowledgement can only
+    # update the scheduler's record, and duplicate starts remain observable.
+    atomic_write_json(workers / f"{worker_id}.starts" / f"{uuid.uuid4().hex}.json", receipt)
 
 
 def _heartbeat_loop(ledger: Ledger, claim: Claim, stop: threading.Event, seconds: float) -> None:
@@ -110,12 +146,7 @@ def run_worker(
     prefer_partition = None
     active_claim = None
 
-    # The launcher learns the external handle only after submission returns.
-    # Wait briefly so the first claimed lease records that durable handle.
-    worker_record = root / "workers" / f"{worker_id}.json"
-    record_deadline = time.time() + 5.0
-    while not worker_record.is_file() and time.time() < record_deadline:
-        time.sleep(0.05)
+    _record_start(root, pool_spec, worker_id)
 
     def preempted(signum, frame):
         del signum, frame
@@ -131,10 +162,13 @@ def run_worker(
             estimate = _next_estimate(ledger, pool, allowed_jobs, now)
             if estimate is not None and deadline - now < 1.5 * estimate:
                 break
+            owner = _identity(root, pool_spec, worker_id)
+            if owner is None:
+                break
             claim = ledger.claim(
                 pool,
                 allowed_jobs,
-                _identity(root, pool_spec, worker_id),
+                owner,
                 prefer_partition,
                 prefer_session_key,
             )
@@ -154,7 +188,7 @@ def run_worker(
                 try:
                     backend = get_backend(str(job_spec["backend"]))(
                         dict(job_spec.get("backend_args") or {}),
-                        asdict(pool_spec),
+                        pool_spec.snapshot(),
                         dict(job_spec.get("pins") or {}),
                     )
                     # The saved key is an affinity hint and may predate the current backend.

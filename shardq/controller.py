@@ -1,25 +1,26 @@
 from __future__ import annotations
 
 import fcntl
-import json
 import logging
 import math
 import sys
 import time
+from itertools import chain
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import shardq
 
 from .cutter import plan_cut, update_history
 from .fs import atomic_write_text
 from .launchers import get_launcher
-from .launchers.base import TransientSubmitError
+from . import submission
+from .launchers.base import Launcher
+from .launchers.reservations import read_reservation
 from .ledger import Ledger, ShardState, atomic_write_json, read_json
 from .merge import merge_partition
-from .spec import PoolSpec, load_pools, resolve_pools_path, slug
+from .spec import PoolSpec, load_pools, resolve_pools_path
 
 
 LOGGER = logging.getLogger("shardq.controller")
@@ -37,24 +38,14 @@ def _package_root() -> Path:
 
 def _launcher(root: Path, name: str, pool: PoolSpec):
     key = (str(root), name, pool.name)
-    if key not in _LAUNCHERS:
+    cached = _LAUNCHERS.get(key)
+    if cached is None or (isinstance(cached, Launcher) and cached.pool != pool):
         _LAUNCHERS[key] = get_launcher(name)(root, pool, _package_root())
     return _LAUNCHERS[key]
 
 
-def _launcher_block(pool: PoolSpec, launcher_name: str) -> dict:
-    if launcher_name == "volc":
-        return pool.volc
-    if launcher_name == "aihc":
-        return pool.aihc
-    return {}
-
-
-def _worker_files(root: Path) -> list:
-    workers = root / "workers"
-    if not workers.is_dir():
-        return []
-    return sorted(workers.glob("*.json"))
+def _managed_pools(pools, launcher_name):
+    return {name for name, pool in pools.items() if launcher_name is None or pool.launcher == launcher_name}
 
 
 def _last_failure_reason(shard_dir: Path) -> str:
@@ -68,44 +59,55 @@ def _last_failure_reason(shard_dir: Path) -> str:
     return str(max(failures, key=lambda row: float(row.get("failed_unix", 0))).get("reason", "backend_error"))
 
 
-def _refresh_workers(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], now: float) -> Dict[str, dict]:
-    workers = {}
-    pending = []
-    for path in _worker_files(root):
-        row = read_json(path, {})
-        if not isinstance(row, dict) or row.get("launcher") != launcher_name:
-            continue
-        pool_name = str(row.get("pool", ""))
-        if pool_name not in pools or pools[pool_name].launcher != launcher_name:
-            continue
-        handle = str(row.get("handle", ""))
-        if row.get("dead") and str(row.get("last_status", "")).startswith("terminal:"):
-            # Terminal launcher states are final: keep the recorded row and skip the
-            # launcher call so tick time does not grow with worker history.
-            workers[handle] = row
-            continue
-        launcher = _launcher(root, launcher_name, pools[pool_name])
-        pending.append((path, row, handle, launcher))
+def _refresh_workers(root: Path, launcher_name: Optional[str], pools: Dict[str, PoolSpec], now: float,
+                     pools_path: str = "", other_reservations=None) -> Dict[str, dict]:
+    managed_pools = _managed_pools(pools, launcher_name)
+    records = []
+    for _, row in submission.worker_records(root):
+        # Switching a pool's launcher cannot discard a reservation in that pool.
+        if (launcher_name is None or row["launcher"] == launcher_name
+                or (row.get("pool") in managed_pools and submission.occupies(row))):
+            records.append(row)
+        elif other_reservations is not None and row.get("submission_state") in submission.UNRESOLVED | {"intent"}:
+            # Explicit filtering disables polling and dispatch for other launchers.
+            # Their outstanding reservations can still charge a shared capacity scope.
+            other_reservations.append(row)
 
-    def refresh(item):
-        path, row, handle, launcher = item
+    def refresh(row):
+        pool = pools.get(row.get("pool"))
+        if pool is None or pool.launcher != row["launcher"]:
+            if submission.occupies(row) and row.get("submission_state") != "conflict":
+                message = "original pool or launcher is no longer configured"
+                if row.get("submission_state"):
+                    submission.conflict(row, message)
+                else:
+                    row["status_error"] = message
+                submission.save(root, row)
+            return row
         try:
-            status = launcher.status(handle)
-            row.pop("status_error", None)
+            launcher = _launcher(root, pool.launcher, pool)
         except Exception as exc:
-            status = str(row.get("last_status", "unknown"))
             row["status_error"] = f"{type(exc).__name__}: {exc}"
-        row["last_status"] = status
-        row["dead"] = status.startswith("terminal:")
-        row["last_checked_unix"] = now
-        atomic_write_json(path, row)
-        return handle, row
+            if row.get("submission_state") in {"submitting", "uncertain"} and now >= row.get("reconcile_after_unix", 0):
+                submission.uncertain(row, row["status_error"], now)
+            submission.save(root, row)
+            return row
+        return submission.refresh(root, pool, launcher, pools_path, _package_root(), row, now)
 
-    if pending:
-        with ThreadPoolExecutor(max_workers=min(STATUS_THREADS, len(pending))) as executor:
-            for handle, row in executor.map(refresh, pending):
-                workers[handle] = row
-    return workers
+    if not records:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(STATUS_THREADS, len(records))) as executor:
+        return {row["worker_id"]: row for row in executor.map(refresh, records)}
+
+
+def _owner_alive(workers: dict, pool: str, owner: dict) -> bool:
+    worker = workers.get(owner.get("worker_id"))
+    if worker is None and owner.get("handle"):
+        # Legacy leases may only carry a launcher handle.
+        worker = next((row for row in workers.values()
+                       if row.get("pool") == pool and row.get("handle") == owner["handle"]), None)
+    return bool(worker and worker.get("pool") == pool and (worker.get("last_status") in {"queued", "running"}
+                or worker.get("submission_state") in submission.UNRESOLVED))
 
 
 def _merge_executor(opts: dict) -> ThreadPoolExecutor:
@@ -124,47 +126,67 @@ def _run_merge(root: Path, job, partition: str, pool: PoolSpec, allow_partial: b
         raise
 
 
-def _update_history(root: Path, jobs: list, now: float, actions: list) -> None:
+def _history_sample(path, cached):
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    stamp = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    if cached and cached[0] == stamp:
+        return cached
+    complete = read_json(path, {})
+    count = int(complete.get("count", 0))
+    if count <= 0:
+        return None
+    return stamp, (float(complete.get("completed_unix", 0)), str(path),
+                   float(complete.get("elapsed_seconds", 0)), count)
+
+
+def _update_history(root: Path, jobs: list, now: float, actions: list, cache=None) -> None:
     history_path = root / "history.json"
     history = read_json(history_path, {})
     if not isinstance(history, dict):
         history = {}
-    events = {}
-    partition_paths = {}
+    if cache is None:
+        cache = {}
+    groups = {}
     for job in jobs:
-        backend = str(job.spec["backend"])
-        session_key = str(job.spec.get("session_key", ""))
         for partition in job.partitions.values():
-            key = f"{backend}:{session_key}:{partition.name}"
+            key = f"{job.spec['backend']}:{job.spec.get('session_key', '')}:{partition.name}"
             partition_dir = root / "jobs" / job.job_id / "partitions" / partition.name
-            partition_paths.setdefault(key, []).append((partition_dir / "partition.json", partition.unit_seconds_est))
+            partitions, paths = groups.setdefault(key, ([], []))
+            partitions.append((partition_dir / "partition.json", partition.unit_seconds_est))
             for shard in partition.shards:
-                shard_dir = partition_dir / "shards" / shard.shard_id
-                for complete_path in sorted((shard_dir / "attempts").glob("*/complete.json")):
-                    complete = read_json(complete_path, {})
-                    count = int(complete.get("count", 0))
-                    if count <= 0:
-                        continue
-                    events.setdefault(key, []).append(
-                        (
-                            float(complete.get("completed_unix", 0)),
-                            str(complete_path),
-                            float(complete.get("elapsed_seconds", 0)),
-                            count,
-                        )
-                    )
+                attempts = partition_dir / "shards" / shard.shard_id / "attempts"
+                paths.extend(attempts / attempt / "complete.json" for attempt in shard.complete_attempts)
 
     changed = False
-    for key, rows in events.items():
-        rebuilt = {}
-        for completed_unix, identity, elapsed, count in sorted(rows):
-            update_history(rebuilt, key, elapsed, count, completed_unix or now)
-        if history.get(key) != rebuilt[key]:
-            history[key] = rebuilt[key]
+    for key in cache.keys() - groups.keys():
+        del cache[key]
+    for key, (partitions, paths) in groups.items():
+        previous, summary = cache.get(key, ({}, {}))
+        samples = {}
+        for path in paths:
+            sample = _history_sample(path, previous.get(path))
+            if sample is not None:
+                samples[path] = sample
+        if samples != previous:
+            # A replay may arrive with an earlier completion time. Recompute the
+            # affected EMA in the original deterministic order, including ties.
+            rebuilt = {}
+            for completed, identity, elapsed, count in sorted(event for stamp, event in samples.values()):
+                update_history(rebuilt, key, elapsed, count, completed)
+            summary = rebuilt.get(key, {})
+        cache[key] = samples, summary
+        if not summary:
+            continue
+        current = dict(summary, updated_unix=summary["updated_unix"] or now)
+        if history.get(key) != current:
+            history[key] = current
             changed = True
-            actions.append({"action": "history", "key": key, "attempts": len(rows)})
-        estimate = float(rebuilt[key]["unit_seconds"])
-        for metadata_path, previous_estimate in partition_paths.get(key, []):
+            actions.append({"action": "history", "key": key, "attempts": len(samples)})
+        estimate = float(current["unit_seconds"])
+        for metadata_path, previous_estimate in partitions:
             if previous_estimate != estimate:
                 Ledger.update_partition(metadata_path, unit_seconds_est=estimate)
     if changed or not history_path.exists():
@@ -223,32 +245,128 @@ def _write_status(root: Path, state: dict) -> None:
     atomic_write_text(path, "\n".join(lines) + "\n")
 
 
-def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict, now: float) -> dict:
+def _submit_workers(root, pool, pools_path, demand, workers, audit_waiters, backoff, max_submits,
+                    actions, warnings, now, other_reservations=()):
+    rows = [row for row in workers.values() if row["pool"] == pool.name]
+    intents = [row for row in rows if row.get("submission_state") == "intent"]
+    # A waiting intent already owns its place. Admit those identities first,
+    # deducting the in-flight workers separately so a reservation can be used.
+    live = [row for row in rows if row.get("submission_state") != "intent" and submission.occupies(row)]
+    occupied = sum(submission.occupies(row) for row in live)
+    wanted = max(0, min(demand, pool.max_workers) - occupied)
+    for row in intents[wanted:]:
+        row.update(submission_state="terminal", last_status="terminal:withdrawn-before-submit", dead=True)
+        submission.save(root, row)
+    if not wanted or backoff.get(pool.name, 0) > now or max_submits <= 0:
+        return
+
+    count = min(wanted, max_submits)
+    if pool.name in audit_waiters:
+        # Use this turn for recovered requests. Other waiting pools get their
+        # turn before this pool can replenish with a fresh identity.
+        count = min(count, len(intents))
+    try:
+        launcher = _launcher(root, pool.launcher, pool)
+        slots = launcher.capacity_slots()
+        if slots is not None and (type(slots) is not int or slots < 0):
+            raise ValueError("capacity_slots must return a nonnegative integer or None")
+        admission = get_launcher(pool.launcher).admission(pool, slots)
+        inputs = launcher.submission_inputs()
+    except Exception as exc:
+        backoff[pool.name] = now + submission.RECONCILE_SECONDS
+        warnings.append(f"{pool.name}: admission failed: {type(exc).__name__}: {exc}")
+        return
+    if slots is not None and admission.units_per_worker:
+        # The provider may still be missing tasks with uncertain acknowledgements.
+        # Charge each recorded candidate in its original resource scope.
+        reserved = 0
+        for row in chain(workers.values(), other_reservations):
+            state = row.get("submission_state")
+            if state not in submission.UNRESOLVED and state != "intent":
+                continue
+            if state == "intent" and (row["pool"] == pool.name or row["pool"] in audit_waiters):
+                # Re-admit saved identities before fresh requests without deadlocking
+                # when two pools have saved intents for the last available slot.
+                continue
+            scope, units = read_reservation(row, admission.units_per_worker)
+            same_budget = bool(scope) and admission.scope[:len(scope)] == scope
+            if row["pool"] == pool.name or same_budget:
+                reserved += submission.occupies(row) * units
+        count = min(count, max(0, slots - reserved) // admission.units_per_worker)
+    if admission.max_queued is not None:
+        queued = sum(submission.occupies(row) for row in live if row.get("last_status") == "queued"
+                     or row.get("submission_state") in submission.UNRESOLVED
+                     or row.get("last_status") == "unknown")
+        count = min(count, max(0, admission.max_queued - queued))
+    if not count:
+        return
+
+    batch = intents[:count]
+    for row in rows:
+        if len(batch) == count:
+            break
+        if row.get("submission_state") == "rejected":
+            command = submission.worker_command(root, pool, pools_path, _package_root(), row["worker_id"])
+            if row.get("request_fingerprint") == submission.fingerprint(pool, inputs, command):
+                row.update(submission_state="intent", last_status="intent", dead=False)
+                submission.save(root, row)
+                batch.append(row)
+    while len(batch) < count:
+        row = submission.intent(root, pool, inputs, pools_path, _package_root(), admission, now)
+        batch.append(row)
+        workers[row["worker_id"]] = row
+
+    # Every intent in the batch is visible before the first external call.
+    def dispatch(row):
+        return submission.dispatch(root, pool, launcher, inputs, pools_path, _package_root(), row, now)
+
+    with ThreadPoolExecutor(max_workers=min(SUBMIT_THREADS, count), thread_name_prefix="shardq-submit") as executor:
+        for row in executor.map(dispatch, batch):
+            state = row["submission_state"]
+            if state == "confirmed":
+                actions.append(dict(action="submit", pool=pool.name, worker_id=row["worker_id"], handle=row["handle"]))
+            elif state == "rejected":
+                LOGGER.warning("worker submission throttled for pool %s: %s", pool.name, row["submission_error"])
+                warnings.append(f"{pool.name}: submit throttled: {row['submission_error']}")
+            else:
+                LOGGER.error("worker submission failed for pool %s: %s", pool.name, row["submission_error"])
+                backoff[pool.name] = now + submission.RECONCILE_SECONDS
+                warnings.append(f"{pool.name}: submit failed: {row['submission_error']}")
+
+
+def tick(root: Path, launcher_name: Optional[str], pools: Dict[str, PoolSpec], opts: dict, now: float) -> dict:
     root = Path(root).resolve()
     ledger = Ledger(root)
     actions = []
     warnings = []
     tick_started = time.time()
-    workers = _refresh_workers(root, launcher_name, pools, now)
+    pools_path = str(opts.get("_pools_path") or "")
+    other_reservations = []
+    workers = _refresh_workers(root, launcher_name, pools, now, pools_path, other_reservations)
     workers_polled = sum(1 for row in workers.values() if row.get("last_checked_unix") == now)
-    relevant_pool_names = {name for name, pool in pools.items() if pool.launcher == launcher_name}
+    relevant_pool_names = _managed_pools(pools, launcher_name)
     job_ids = [
         job_id
         for job_id in ledger.list_jobs()
         if str(read_json(ledger.job_dir(job_id) / "job.json", {}).get("pool")) in relevant_pool_names
     ]
 
-    def alive(owner: dict) -> bool:
-        status = str((workers.get(str(owner.get("handle"))) or {}).get("last_status", "unknown"))
-        return status in {"running", "queued"}
-
+    # Only reuse fully drained job views between phases of this tick. A
+    # manually published partial partition may still have uncut or live work.
+    drained = {}
     for job_id in job_ids:
         job = ledger.scan_job(job_id, now)
+        if all(part.status in {"merged", "partial"} and part.next_cut == part.size
+               and not (part.pending or part.backoff or any(s.lease_present for s in part.shards))
+               for part in job.partitions.values()):
+            drained[job_id] = job
+            continue
         ttl = int((job.spec.get("retry") or {}).get("lease_ttl_seconds", 900))
-        for shard_id in ledger.expire_leases(job_id, ttl, alive, now):
+        for shard_id in ledger._expire_scanned_leases(job, ttl, lambda owner: _owner_alive(workers, job.pool, owner), now):
             actions.append({"action": "expire", "job_id": job_id, "shard_id": shard_id})
 
-    for job_id in job_ids:
+    active_ids = [job_id for job_id in job_ids if job_id not in drained]
+    for job_id in active_ids:
         job = ledger.scan_job(job_id, now)
         retry = job.spec.get("retry") or {}
         max_depth = int(math.ceil(math.log(max(1, int((job.spec.get("shard") or {}).get("max_units", 1))), 2)))
@@ -268,11 +386,11 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
                     ledger.quarantine(job_id, shard.shard_id, reason, now)
                     actions.append({"action": "quarantine", "job_id": job_id, "shard_id": shard.shard_id, "reason": reason})
 
-    jobs = [ledger.scan_job(job_id, now) for job_id in job_ids]
-    _update_history(root, jobs, now, actions)
+    jobs = [drained.get(job_id) or ledger.scan_job(job_id, now) for job_id in job_ids]
+    _update_history(root, jobs, now, actions, opts.setdefault("_history_cache", {}))
 
     max_cuts = int(opts.get("max_cuts_per_tick", 64))
-    for job_id in job_ids:
+    for job_id in active_ids:
         job = ledger.scan_job(job_id, now)
         if job.claims_blocked:
             continue
@@ -315,7 +433,7 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
             merge_retry_after[key] = now + MERGE_RETRY_SECONDS
             warnings.append(f"{key[0]}:{key[1]}: merge failed: {type(exc).__name__}: {exc}")
 
-    for job_id in job_ids:
+    for job_id in active_ids:
         job = ledger.scan_job(job_id, now)
         pool = pools[job.pool]
         for name, partition in job.partitions.items():
@@ -337,103 +455,27 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
             actions.append({"action": "merge_start", "job_id": job_id, "partition": name})
 
     backoff = opts.setdefault("_pool_backoff", {})
-    current_jobs = [ledger.scan_job(job_id, now) for job_id in job_ids]
+    current_jobs = [ledger.scan_job(job_id, now) for job_id in active_ids]
     max_submits = int(opts.get("max_submits_per_tick", 4))
-    for pool_name in sorted(relevant_pool_names):
+    audit_waiters = set()
+    saved_pools = {row["pool"] for row in workers.values() if row.get("submission_state") == "intent"}
+    for pool_name in relevant_pool_names & saved_pools:
         pool = pools[pool_name]
-        if float(backoff.get(pool_name, 0)) > now:
+        try:
+            if get_launcher(pool.launcher).admission(pool, None).recheck_shared_capacity:
+                audit_waiters.add(pool_name)
+        except Exception:
+            # Keep its reservation charged. The admission pass reports the error.
             continue
-        pool_jobs = [job for job in current_jobs if job.pool == pool_name and not job.claims_blocked]
-        pending = 0
-        leased = 0
-        for job in pool_jobs:
-            for partition in job.partitions.values():
-                pending += partition.pending + partition.backoff
-                leased += partition.leased
-        demand = pending + leased
-        pool_workers = [row for row in workers.values() if row.get("pool") == pool_name]
-        non_dead = [row for row in pool_workers if not str(row.get("last_status", "")).startswith("terminal:")]
-        queued = sum(row.get("last_status") == "queued" for row in non_dead)
-        running = len(non_dead)
-        to_submit = max(0, min(demand - running, pool.max_workers - running, max_submits))
-        launcher = _launcher(root, launcher_name, pool)
-        slots = launcher.capacity_slots()
-        launcher_block = _launcher_block(pool, launcher_name)
-        gpu_slots = int(launcher_block.get("gpu_slots", 1))
-        if slots is not None:
-            to_submit = min(to_submit, int(slots) // max(1, gpu_slots))
-        elif launcher_name in {"volc", "aihc"}:
-            max_queued = int(launcher_block.get("max_queued", 0))
-            to_submit = (
-                0 if queued >= max_queued else min(to_submit, max_queued - queued)
-            )
-        submissions = []
-        for index in range(to_submit):
-            worker_id = f"shardq-{slug(pool_name)}-{int(now * 1000)}-{index}"
-            pools_path = str(opts.get("_pools_path") or "")
-            env = dict(pool.env)
-            env.update(
-                {
-                    "SHARDQ_ROOT": str(root),
-                    "SHARDQ_POOL": pool_name,
-                    "SHARDQ_POOLS": pools_path,
-                    "SHARDQ_WORKER_ID": worker_id,
-                    "SHARDQ_MAX_WALL": str(pool.worker_max_wall_seconds),
-                    "SHARDQ_IDLE_EXIT": str(pool.worker_idle_exit_seconds),
-                    "SHARDQ_PKG": str(_package_root()),
-                }
-            )
-            worker_argv = [
-                "--root", str(root), "--pool", pool_name, "--worker-id", worker_id,
-                "--max-wall-seconds", str(pool.worker_max_wall_seconds),
-                "--idle-exit-seconds", str(pool.worker_idle_exit_seconds),
-            ]
-            if pools_path:
-                worker_argv.extend(["--pools", pools_path])
-            submissions.append((worker_id, worker_argv, env))
-
-        def submit(item):
-            worker_id, worker_argv, env = item
-            try:
-                handle = launcher.submit(worker_id, worker_argv, env)
-                return worker_id, handle, None
-            except Exception as exc:
-                if isinstance(exc, TransientSubmitError):
-                    LOGGER.warning("worker submission throttled for pool %s: %s", pool_name, exc)
-                else:
-                    LOGGER.exception("worker submission failed for pool %s", pool_name)
-                return worker_id, None, exc
-
-        if submissions:
-            with ThreadPoolExecutor(
-                max_workers=min(SUBMIT_THREADS, to_submit), thread_name_prefix="shardq-submit"
-            ) as executor:
-                for worker_id, handle, exc in executor.map(submit, submissions):
-                    if exc is not None:
-                        if isinstance(exc, TransientSubmitError):
-                            warnings.append(f"{pool_name}: submit throttled: {exc}")
-                        else:
-                            backoff[pool_name] = now + 300
-                            warnings.append(f"{pool_name}: submit failed: {type(exc).__name__}: {exc}")
-                        continue
-                    row = {
-                        "worker_id": worker_id,
-                        "pool": pool_name,
-                        "launcher": launcher_name,
-                        "handle": handle,
-                        "submitted_unix": now,
-                        "last_status": (
-                            "queued"
-                            if launcher_name in {"volc", "aihc"}
-                            else "running"
-                        ),
-                        "last_checked_unix": now,
-                        "dead": False,
-                        "gpu_slots": gpu_slots,
-                    }
-                    atomic_write_json(root / "workers" / f"{worker_id}.json", row)
-                    workers[handle] = row
-                    actions.append({"action": "submit", "pool": pool_name, "worker_id": worker_id, "handle": handle})
+    # The root lock serializes pools. Each pool finishes its batch before the
+    # next one queries the provider and accounts for unresolved ledger rows.
+    for pool_name in sorted(relevant_pool_names, key=lambda name: (name not in audit_waiters, name)):
+        pool = pools[pool_name]
+        demand = sum(part.pending + part.backoff + part.leased
+                     for job in current_jobs if job.pool == pool_name and not job.claims_blocked
+                     for part in job.partitions.values())
+        _submit_workers(root, pool, pools_path, demand, workers, audit_waiters, backoff, max_submits,
+                        actions, warnings, now, other_reservations)
 
     final_jobs = [ledger.scan_job(job_id, now) for job_id in job_ids]
     for job in final_jobs:
@@ -490,7 +532,7 @@ def _configure_logging(root: Path) -> None:
 
 def run_scheduler(
     root: Path,
-    launcher_name: str,
+    launcher_name: Optional[str],
     poll_seconds: int,
     once: bool,
     exit_when_idle: bool,
@@ -549,10 +591,7 @@ def run_scheduler(
                     if not job.get("stopped", False) and job.get("setup_status") != "paused"
                     for partition in job["partitions"].values()
                 )
-                alive = any(
-                    not str(worker.get("last_status", "")).startswith("terminal:")
-                    for worker in state["workers"]
-                )
+                alive = any(submission.occupies(worker) for worker in state["workers"])
                 leased = any(
                     partition.get("active_leases", partition.get("leased", 0)) > 0
                     for job in state["jobs"]

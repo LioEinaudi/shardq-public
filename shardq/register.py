@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import subprocess
 import time
 from dataclasses import asdict
@@ -11,6 +10,8 @@ from . import __version__
 from .backend_exec import run_backend_op
 from .backends import get_backend
 from .cutter import estimate_unit_seconds
+from .launchers import get_launcher
+from .fs import sha256_file
 from .ledger import atomic_write_json, read_json
 from .spec import (
     JOB_ID_RE,
@@ -19,14 +20,6 @@ from .spec import (
     load_pools,
     resolve_pools_path,
 )
-
-
-def _launcher_block(pool: PoolSpec) -> dict:
-    if pool.launcher == "volc":
-        return pool.volc
-    if pool.launcher == "aihc":
-        return pool.aihc
-    return {}
 
 
 def _git(root: Path, *arguments: str, optional: bool = False) -> Optional[str]:
@@ -78,13 +71,9 @@ def register(
 
     backend_class = get_backend(spec.backend)
     pin_hook = backend_class.preview_pins if dry_run else backend_class.pins
-    launcher_block = _launcher_block(pool)
-    pins = {
-        "image": launcher_block.get("image"),
-        "flavor": launcher_block.get(
-            "flavor", launcher_block.get("gpu_resource")
-        ),
-    }
+    source = get_launcher(pool.launcher).execution_source(pool)
+    pins = {"image": source.get("image"), "flavor": source.get("flavor"),
+            "execution_source": source}
     pins.update(pin_hook(pool, root, spec.job_id, pin_mode))
     control_root = Path.cwd().resolve()
     pins["control_root"] = str(control_root)
@@ -93,22 +82,16 @@ def register(
     )
     pins["shardq_version"] = __version__
 
-    operation_pins = dict(pins)
-    if (
-        dry_run
-        and pin_mode == "worktree"
-        and operation_pins.get("lmms_source_root")
-    ):
-        operation_pins["lmms_root"] = operation_pins["lmms_source_root"]
     backend_payload = {
         "backend": spec.backend,
         "backend_args": spec.backend_args,
-        "pool": asdict(pool),
+        "pool": pool.snapshot(),
         "pins": pins,
     }
     if sizes is None:
-        described = run_backend_op(pool, "describe", {**backend_payload, "pins": operation_pins})
+        described = run_backend_op(pool, "describe", {**backend_payload, "dry_run": dry_run})
         partition_rows = described["partitions"]
+        session_key = str(described["session_key"])
     else:
         partition_rows = [
             {
@@ -120,9 +103,6 @@ def register(
             for name, size in sizes.items()
         ]
 
-    if sizes is None and operation_pins == pins:
-        session_key = str(described["session_key"])
-    else:
         session_key = str(run_backend_op(pool, "session_key", backend_payload)["session_key"])
 
     names = [str(row["name"]) for row in partition_rows]
@@ -144,13 +124,14 @@ def register(
             "schema_version": 1,
             "column": column,
             "pins": pins,
-            "pool_snapshot": asdict(pool),
+            "pool_snapshot": pool.snapshot(),
             "session_key": session_key,
             "registered_unix": time.time(),
             "spec_file": str(spec_path.resolve()),
-            "spec_sha256": hashlib.sha256(spec_path.read_bytes()).hexdigest(),
+            "spec_sha256": sha256_file(spec_path),
         }
     )
+    job_payload["backend_report"] = backend_class.report_metadata(job_payload)
     if dry_run:
         return job_payload
 

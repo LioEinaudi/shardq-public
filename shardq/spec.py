@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -40,6 +40,20 @@ class PoolSpec:
     worker_idle_exit_seconds: int
     extra: dict
     aihc: dict = field(default_factory=dict)
+    _launcher_options: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def launcher_args(self) -> dict:
+        # Preserve the mutable attributes used by existing Python integrations.
+        if self.launcher in ("volc", "aihc"):
+            return getattr(self, self.launcher)
+        return self._launcher_options
+
+    def snapshot(self) -> dict:
+        values = asdict(self)
+        values.pop("_launcher_options")
+        values["launcher_args"] = self.launcher_args.copy()
+        return values
 
 
 @dataclass
@@ -90,8 +104,22 @@ def pool_from_dict(name: str, row: dict) -> PoolSpec:
     if not isinstance(row, dict):
         raise ValueError(f"pool {name!r} must be an object")
     launcher = str(row.get("launcher", ""))
-    if launcher not in {"local", "volc", "aihc"}:
-        raise ValueError(f"pool {name!r}: invalid launcher {launcher!r}")
+    from .launchers import validate_launcher_name
+
+    validate_launcher_name(launcher)
+    blocks = {}
+    for key in ("launcher_args", "volc", "aihc"):
+        value = row.get(key, {})
+        if value is None and key != "launcher_args":
+            value = {}  # Historical snapshots allowed null provider sections.
+        if not isinstance(value, dict):
+            raise ValueError(f"pool {name!r}: {key} must be an object")
+        blocks[key] = dict(value)
+    if launcher in ("volc", "aihc") and "launcher_args" in row:
+        if blocks[launcher] and blocks[launcher] != blocks["launcher_args"]:
+            raise ValueError(f"pool {name!r}: conflicting {launcher} and launcher_args")
+        blocks[launcher] = blocks["launcher_args"]
+
     extra = dict(row.get("extra") or {})
     # Old ledger snapshots stored these two backend-specific fields at top level.
     if "column" in row and "column" not in extra:
@@ -103,14 +131,15 @@ def pool_from_dict(name: str, row: dict) -> PoolSpec:
         backend=str(row.get("backend", "")),
         entry=str(row.get("entry", "")),
         launcher=launcher,
-        volc=dict(row.get("volc") or {}),
+        volc=blocks["volc"],
         env={str(key): str(value) for key, value in (row.get("env") or {}).items()},
         local_python=str(row["local_python"]) if row.get("local_python") else None,
         max_workers=int(row.get("max_workers", 1)),
         worker_max_wall_seconds=int(row.get("worker_max_wall_seconds", 14400)),
         worker_idle_exit_seconds=int(row.get("worker_idle_exit_seconds", 300)),
         extra=extra,
-        aihc=dict(row.get("aihc") or {}),
+        aihc=blocks["aihc"],
+        _launcher_options=blocks["launcher_args"] if launcher not in ("volc", "aihc") else {},
     )
     if not spec.backend:
         raise ValueError(f"pool {name!r}: backend is required")

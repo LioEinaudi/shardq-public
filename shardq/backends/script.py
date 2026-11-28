@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import List
 
-from ..ledger import atomic_write_json
+from ..fs import atomic_write_json, write_records
 from .base import Backend, Partition, RangeResult, session_fingerprint, validate_unit_ids
 
 
@@ -94,17 +94,33 @@ class ScriptBackend(Backend):
         validate_unit_ids(result.records_file, start, count)
 
     def merge(self, partition: Partition, records: List[dict], out_dir: Path, meta: dict) -> dict:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        records_path = out_dir / "records.jsonl"
-        records_path.write_text(
-            "".join(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n" for row in records),
-            encoding="utf-8",
-        )
-        meta_path = out_dir / "meta.json"
-        atomic_write_json(meta_path, meta)
+        # Preserve direct callers of the original list API.
+        path = out_dir / "records.jsonl"
+        checksum = write_records(path, records)
+        present = {row["unit_id"] for row in records}
+        details = dict(meta, expected_units=partition.size, completed_units=len(present),
+                       record_count=len(records),
+                       artifacts={"records": {"path": str(path.resolve()), "sha256": checksum}})
+        details.setdefault("missing_units", sorted(set(range(partition.size)) - present))
+        return self._summarize(partition, path, out_dir, details)
+
+    def merge_file(self, partition: Partition, records_file: Path, out_dir: Path, meta: dict) -> dict:
+        if type(self).merge is not ScriptBackend.merge:
+            # A pre-existing ScriptBackend subclass can override list aggregation.
+            return super().merge_file(partition, records_file, out_dir, meta)
+        return self._summarize(partition, records_file, out_dir, meta)
+
+    def _summarize(self, partition: Partition, records_path: Path, out_dir: Path, meta: dict) -> dict:
         command = self.backend_args.get("merge_command")
         if not command:
-            raise ValueError("script backend requires merge_command")
+            summary = {key: meta[key] for key in
+                       ("expected_units", "completed_units", "record_count", "missing_units", "artifacts")}
+            summary.update(schema_version=1, job_id=meta.get("job_id"), partition=partition.name,
+                           status="partial" if meta["missing_units"] else "complete")
+            atomic_write_json(out_dir / "results.json", summary)
+            return {}
+        meta_path = out_dir / "meta.json"
+        atomic_write_json(meta_path, meta)
         env = dict(os.environ)
         env.update(
             SHARDQ_PARTITION=partition.name,

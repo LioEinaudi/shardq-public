@@ -1,0 +1,9 @@
+{
+  "pools": {
+    "cpu": {
+      "backend": "script",
+      "launcher": "local",
+      "worker_idle_exit_seconds": 1
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "job_id": "ticket-tags",
+  "pool": "cpu",
+  "backend": "ticket_tags:TicketBackend",
+  "protocol_id": "routing-rules-v1",
+  "backend_args": {
+    "tickets": ["Refund not received", "Cannot log in", "Invoice copy", "Office address"],
+    "rules": [
+      {"tag": "billing", "pattern": "refund|invoice"},
+      {"tag": "access", "pattern": "log in|password"}
+    ]
+  },
+  "shard": {"min_units": 2, "max_units": 2}
+}
