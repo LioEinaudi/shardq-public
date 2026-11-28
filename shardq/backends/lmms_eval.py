@@ -11,22 +11,11 @@ from typing import List, Optional, Tuple
 
 from ..ledger import atomic_write_json
 from ..spec import PoolSpec
-from .lmms_reports import LmmsReports
+from .lmms_reports import LmmsReports, _public_scalars
 from .base import (
     Backend, Partition, RangeResult, RangeValidationError, WorkerRestartRequired,
     session_fingerprint, validate_unit_ids,
 )
-
-
-def _public_scalars(metrics: dict) -> dict:
-    result = {}
-    for key, value in metrics.items():
-        lower = str(key).lower()
-        if key == "alias" or "stderr" in lower or lower.startswith("submission"):
-            continue
-        if isinstance(value, (int, float, str, bool)):
-            result[str(key)] = value
-    return result
 
 
 class _LmmsSession:
@@ -494,11 +483,8 @@ class LmmsEvalBackend(LmmsReports, Backend):
             records_path = shard.get("records_file")
             if not raw_path or not records_path or not Path(raw_path).is_file():
                 continue
-            shard_rows = [
-                json.loads(line)
-                for line in Path(records_path).read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
+            with Path(records_path).open(encoding="utf-8") as stream:
+                shard_rows = [json.loads(line) for line in stream if line.strip()]
             # Public scalars never include stderr, so skip the bootstrap and reuse
             # the task object: a full-size partition has hundreds of shards.
             _, shard_metrics, _ = self._aggregate_rows(

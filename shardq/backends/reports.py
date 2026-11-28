@@ -9,6 +9,7 @@ def report_for_job(spec: dict) -> dict:
 
     return LmmsReports.report_metadata(spec)
 
+
 def attempt_report(extra: dict) -> dict:
     """Preserve the v1 raw artifact alias alongside namespaced adapter data."""
     return {"backend_extra": extra, "raw_results": extra.get("raw_results")}

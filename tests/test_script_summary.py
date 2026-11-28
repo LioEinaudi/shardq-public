@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from shardq.ledger import Ledger, atomic_write_json, read_json
 from shardq.merge import merge_partition
@@ -84,6 +85,65 @@ class ScriptSummaryTests(unittest.TestCase):
         self.register(1)
         self.quarantine()
         self.check_summary(1, [0], [])
+
+    def test_overlapping_disordered_ranges_keep_global_first_seen_order(self):
+        self.register(4)
+        a = {"unit_id": 0, "filter": "z", "from": "first"}
+        b = {"unit_id": 0, "filter": "a", "from": "second"}
+        c = {"unit_id": 3, "filter": "z", "from": "first"}
+        self.complete(2, [c, a, {**a, "from": "discard"}])
+        self.complete(2, [{"unit_id": 1}, b, {**a, "from": "discard again"},
+                          {"unit_id": 2}, {**c, "from": "discard last"}])
+        expected = [a, b, {"unit_id": 1}, {"unit_id": 2}, c]
+        # A one-line run budget forces several merge passes on this small fixture.
+        for budget in (4 * 1024 * 1024, 1):
+            with self.subTest(budget=budget), patch("shardq.merge._SORT_BYTES", budget), \
+                    patch("shardq.merge._MERGE_FAN_IN", 2):
+                self.check_summary(4, [], expected)
+
+    def test_utf8_and_historical_newlines_hash_the_original_bytes(self):
+        self.register(2)
+        self.ledger.cut("files", "input", 2, 1, 1)
+        claim = self.ledger.claim("local", ["files"], {"worker_id": "w"}, None, None, 2)
+        path = claim.attempt_dir / "records.jsonl"
+        path.write_bytes('{"unit_id":1,"text":"雪"}\r{"unit_id":0}\r\n'.encode("utf-8"))
+        self.ledger.complete(claim, path, 2, 2, 1, {}, 3)
+        self.check_summary(2, [], [{"unit_id": 0}, {"unit_id": 1, "text": "雪"}])
+
+    def test_corrupt_later_attempt_preserves_previously_published_files(self):
+        self.register(2)
+        self.complete(1, [{"unit_id": 0}])
+        self.complete(1, [{"unit_id": 1}])
+        self.merge(False)
+        before = {path.name: path.read_bytes() for path in self.out.iterdir()}
+        attempts = sorted(self.ledger.job_dir("files").glob("partitions/input/shards/*/attempts/*/records.jsonl"))
+        attempts[-1].write_text('{"unit_id":1,"tampered":true}\n')
+        with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+            self.merge(False)
+        self.assertEqual({path.name: path.read_bytes() for path in self.out.iterdir()}, before)
+
+    def test_coverage_errors_do_not_publish_records_or_call_custom_merge(self):
+        self.register(2, merge_command="exit 99")
+        self.complete(2, [{"unit_id": 0}])
+        with self.assertRaisesRegex(ValueError, "missing 1 units"):
+            self.merge(False)
+        self.assertFalse((self.out / "records.jsonl").exists())
+
+    def test_late_completion_visible_to_merge_after_scan_selects_earliest_attempt(self):
+        self.register(1)
+        self.ledger.cut("files", "input", 1, 1, 1)
+        old = self.ledger.claim("local", ["files"], {"worker_id": "old"}, None, None, 2)
+        self.ledger.expire_leases("files", 2, lambda _: False, 8)
+        replacement = self.ledger.claim("local", ["files"], {"worker_id": "replacement"}, None, None, 9)
+        for claim, finish in ((replacement, 12), (old, 11)):
+            path = claim.attempt_dir / "records.jsonl"
+            path.write_text(json.dumps({"unit_id": 0, "attempt": claim.attempt_id}) + "\n")
+            self.ledger.complete(claim, path, 1, 2, 1, {}, finish)
+            if claim is replacement:
+                snapshot = self.ledger.scan_job("files", 13)
+        report = merge_partition(self.root, snapshot, "input", self.pool, False, 14)
+        self.assertEqual(report["shards_used"][0]["attempt_id"], old.attempt_id)
+        self.assertEqual(read_json(self.out / "records.jsonl")["attempt"], old.attempt_id)
 
     def test_custom_command_receives_records_and_meta_and_owns_its_result(self):
         script = self.root / "custom.py"

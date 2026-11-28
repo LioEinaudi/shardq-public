@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from shardq.cli import _publish
+
 
 PROJECT = Path(__file__).resolve().parents[1]
 EXAMPLE = PROJECT / "examples" / "manifest_script"
@@ -71,6 +73,12 @@ class ManifestScriptTests(unittest.TestCase):
                 copy = exported / source.name
                 shutil.copyfile(source, copy)
                 self.assertEqual(hashlib.sha256(copy.read_bytes()).hexdigest(), artifact[kind]["sha256"])
+
+            # The publication manifest must agree with the checksums fixed at merge time.
+            (merged / "results.json").write_text("{}")
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                _publish(root, "file-hashes", work / "changed")
+            self.assertFalse((work / "changed").exists())
 
     def test_script_only_opens_files_in_its_range(self):
         with tempfile.TemporaryDirectory() as directory:

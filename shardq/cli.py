@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import multiprocessing
 import os
@@ -14,7 +13,7 @@ from typing import Dict, List, Optional
 
 from .backends.reports import report_for_job
 from .controller import run_scheduler
-from .fs import atomic_output, atomic_write_text
+from .fs import sha256_file, atomic_output, atomic_write_text
 from .launchers import get_launcher
 from .ledger import Ledger, atomic_write_json, read_json
 from .merge import merge_partition
@@ -118,17 +117,14 @@ def _publish(root: Path, job_id: str, out_dir: Path) -> dict:
     run_dir = Path(out_dir).expanduser().resolve()
     if run_dir.exists():
         raise ValueError(f"output directory already exists: {run_dir}")
-    target_markers = run_dir / "state" / "full" / job.column
-    target_markers.mkdir(parents=True)
-    marker_source = ledger.job_dir(job_id) / "markers" / job.column
-    for marker in sorted(marker_source.glob("*.json")):
-        _atomic_copy(marker, target_markers / marker.name)
-
     artifacts = []
     missing_ids = {}
     for name in sorted(job.partitions):
         merged = ledger.job_dir(job_id) / "merged" / name
-        missing_ids[name] = read_json(merged / "merge.json")["missing_units"]
+        merge_info = read_json(merged / "merge.json")
+        if not isinstance(merge_info, dict) or "missing_units" not in merge_info:
+            raise ValueError(f"missing coverage report for partition {name}")
+        missing_ids[name] = merge_info["missing_units"]
         row = {"partition": name}
         for kind in ("results", "records"):
             path = (
@@ -136,10 +132,11 @@ def _publish(root: Path, job_id: str, out_dir: Path) -> dict:
                 if kind == "results"
                 else merged / "records.jsonl"
             )
-            row[kind] = {
-                "path": str(path.resolve()),
-                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            }
+            digest = sha256_file(path)
+            recorded = merge_info.get("artifacts", {}).get(kind)
+            if recorded is not None and digest != recorded.get("sha256"):
+                raise ValueError(f"merged artifact checksum mismatch: {path}")
+            row[kind] = {"path": str(path.resolve()), "sha256": digest}
         artifacts.append(row)
 
     pins = job.spec.get("pins") or {}
@@ -183,6 +180,12 @@ def _publish(root: Path, job_id: str, out_dir: Path) -> dict:
         "acceptance": "acceptance.json",
         "summary": "summary.md",
     }
+    target_markers = run_dir / "state" / "full" / job.column
+    target_markers.mkdir(parents=True)
+    marker_source = ledger.job_dir(job_id) / "markers" / job.column
+    for marker in sorted(marker_source.glob("*.json")):
+        _atomic_copy(marker, target_markers / marker.name)
+
     atomic_write_json(run_dir / "run.json", run_payload)
     atomic_write_json(
         run_dir / "artifacts.json",
