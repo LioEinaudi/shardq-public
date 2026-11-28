@@ -14,7 +14,7 @@ then `$SHARDQ_POOLS`, then `<root>/pools.json`, else error. Any `ValueError`,
 - Runs the backend `describe` operation to enumerate partitions and sizes. It executes
   through `pool.local_python` when that is set, so a control host without the backend's
   dependencies still works. `--sizes p0=40 p1=24` skips describe and uses those sizes.
-- Pins recorded in `job.json`: `image` and `flavor` from `pool.volc`, `control_root` and
+- Pins recorded in `job.json`: `image` and `flavor` from launcher execution provenance, `control_root` and
   `control_commit` (git HEAD of the current directory, if any), `shardq_version`, plus
   backend pins. The lmms backend records source root, resolved root, branch, upstream,
   remote, commit, dirty flag, pin mode, and an import proof. `--pin-mode worktree`
@@ -25,11 +25,11 @@ then `$SHARDQ_POOLS`, then `<root>/pools.json`, else error. Any `ValueError`,
   backend hint. `--dry-run` prints the payload and writes nothing.
 - Prints the job payload as JSON on success.
 
-## scheduler [--launcher volc|local|aihc] [--poll-seconds 60] [--once] [--exit-when-idle] [--max-submits-per-tick 4] [--max-cuts-per-tick 64] [--require-complete]
+## scheduler [--launcher NAME] [--poll-seconds 60] [--once] [--exit-when-idle] [--max-submits-per-tick 4] [--max-cuts-per-tick 64] [--require-complete]
 
 - Holds a non-blocking `flock` on `<root>/scheduler/lock`; exits 3 if another scheduler
   holds it.
-- Handles only jobs whose pool uses the selected launcher. Default is `volc`.
+- Serves all pools by default. An explicit alias or `module:Class` selects only pools using that exact launcher. Use `--launcher volc` to retain the previous default.
 - One tick, in order: refresh worker statuses through the launcher (workers already in a
   `terminal:*` state are not polled again; live ones are polled with 8 threads); expire leases;
   bisect or quarantine shards over `max_errors` or `max_preemptions`; update the runtime

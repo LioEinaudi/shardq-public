@@ -5,7 +5,6 @@ import os
 import subprocess
 import sys
 import tempfile
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict
 
@@ -63,7 +62,7 @@ def run_backend_op(pool: PoolSpec, op: str, payload: dict) -> dict:
     envelope: Dict[str, Any] = dict(payload)
     envelope.setdefault("backend", pool.backend)
     envelope.setdefault("backend_args", {})
-    envelope.setdefault("pool", asdict(pool))
+    envelope.setdefault("pool", pool.snapshot())
     envelope.setdefault("pins", {})
     python = pool.local_python or sys.executable
     lmms_root = (envelope.get("pins") or {}).get("lmms_root")

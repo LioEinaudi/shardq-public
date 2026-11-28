@@ -61,9 +61,10 @@ launcher no longer reports a live worker, or unconditionally after two TTLs.
 |---|---|---|---|
 | `backend` | string | required | built-in name or `module:Class` |
 | `entry` | string | "" | absolute path of the container entry script; Volc only |
-| `launcher` | string | required | `local` or `volc` |
+| `launcher` | string | required | `local`, `volc`, `aihc` or `module:Class` |
 | `volc` | object | {} | see below |
 | `env` | object | {} | exported into the worker environment |
+| `launcher_args` | object | {} | options for the selected launcher |
 | `local_python` | string | null | interpreter for describe and merge on the control host |
 | `max_workers` | int | 1 | live workers per pool |
 | `worker_max_wall_seconds` | int | 14400 | worker wall clock; Volc deadline is this plus 1800 |

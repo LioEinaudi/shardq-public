@@ -150,8 +150,7 @@ whose `open_session` loads once per worker (`docs/design.md`, "Adding a backend"
 New backend: subclass `shardq.backends.base.Backend` (`describe`, `session_key`,
 `open_session`, `validate_range`, `merge`, optional class-level `pins`), reference it as
 `module:Class` in the pool. New cloud: subclass `shardq.launchers.base.Launcher`
-(`submit`, `status`, `kill`, optional `capacity_slots`) and add it to
-`shardq.launchers.get_launcher`. Keep imports lazy so `import shardq` stays dependency-free.
+(`submit`, `status`, `kill`, optional `capacity_slots`) and select it by `module:Class` in the pool. Keep imports lazy so `import shardq` stays dependency-free.
 Run `python -m unittest discover -s tests -v` afterwards.
 
 ## Hard rules

@@ -7,6 +7,8 @@ import json
 from uuid import uuid4
 
 from .fs import atomic_write_json
+from .launchers import get_launcher
+from .launchers.reservations import reservation_fields
 from .launchers.base import SubmissionChangedError, TransientSubmitError
 from .ledger import read_json
 
@@ -53,23 +55,20 @@ def worker_command(root, pool, pools_path, package_root, worker_id):
 def fingerprint(pool, inputs, command):
     # Quotas control admission. A changed queue, image, command, or execution
     # environment changes the request. Persist the digest, never the environment.
-    block = dict(getattr(pool, pool.launcher, {}))
-    for key in ("max_queued", "gpu_cap", "capacity_mode"):
-        block.pop(key, None)
+    admission_only = get_launcher(pool.launcher).admission_only_args
+    block = {key: value for key, value in pool.launcher_args.items() if key not in admission_only}
     description = [pool.name, pool.launcher, pool.backend, pool.entry,
                    pool.extra, pool.local_python, block, inputs, command]
     return hashlib.sha256(json.dumps(description, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def intent(root, pool, inputs, pools_path, package_root, gpu_slots, now):
+def intent(root, pool, inputs, pools_path, package_root, admission, now):
     worker_id = "shardq-" + uuid4().hex
     command = worker_command(root, pool, pools_path, package_root, worker_id)
     row = dict(worker_id=worker_id, request_id=worker_id, pool=pool.name, launcher=pool.launcher,
-               request_fingerprint=fingerprint(pool, inputs, command), launcher_inputs=inputs, gpu_slots=gpu_slots,
+               request_fingerprint=fingerprint(pool, inputs, command), launcher_inputs=inputs,
                submitted_unix=now, submission_state="intent", last_status="intent", dead=False)
-    if pool.launcher == "volc":
-        row["resource_queue"] = pool.volc.get("queue")
-        row["resource_creator"] = pool.volc.get("creator")
+    row.update(reservation_fields(pool, admission))
     save(root, row)
     return row
 
@@ -88,7 +87,7 @@ def confirm(row, handle, now):
     if not isinstance(handle, str) or not handle.strip():
         raise ValueError("platform returned an empty or invalid handle")
     row.update(submission_state="confirmed", handle=handle, dead=False, last_checked_unix=now,
-               last_status="queued" if row["launcher"] in {"volc", "aihc"} else "running")
+               last_status=get_launcher(row["launcher"]).initial_status)
     row.pop("submission_error", None)
     row.pop("reconcile_after_unix", None)
 

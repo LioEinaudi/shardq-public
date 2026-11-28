@@ -1,5 +1,6 @@
 """Process-exit tests for the scheduler's durable worker submission protocol."""
 
+import hashlib
 import json
 import multiprocessing
 import os
@@ -372,6 +373,50 @@ class SubmissionRecoveryTests(unittest.TestCase):
         self.assertEqual(len(list((self.service / "other").glob("*.json"))), 1)
         self.assertEqual(len(list((self.service / "q").glob("*.json"))), 0,
                          "a second task exceeded the original shared audit budget")
+
+    def test_stage_b_intent_survives_migration_to_launcher_args(self):
+        from shardq.spec import pool_from_dict
+        from shardq.submission import worker_command
+
+        config = {"queue": "research", "creator": "tester", "gpu_slots": 2, "max_queued": 1}
+        self.configure_pool(launcher="volc", volc=config)
+        self.run_tick(100, "after-intent", CRASHED)
+        row = self.row()
+        row.pop("capacity_scope")
+        row.pop("capacity_units")
+        # The unversioned Stage B digest serialized this exact list. Persist a
+        # legacy row independently of the current request fingerprint function.
+        pool = pool_from_dict("p", self.pool)
+        command = worker_command(self.root, pool, str(self.root / "pools.json"),
+                                 controller._package_root(), row["worker_id"])
+        description = ["p", "volc", "fake", "", {}, None,
+                       {"queue": "research", "creator": "tester", "gpu_slots": 2}, {}, command]
+        row["request_fingerprint"] = hashlib.sha256(
+            json.dumps(description, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        atomic_write_json(self.root / "workers" / (row["worker_id"] + ".json"), row)
+        self.configure_pool(launcher="volc", launcher_args=dict(config, max_queued=2))
+        self.run_tick(200)
+        self.assertEqual(self.row()["submission_state"], "confirmed")
+        self.assertEqual(self.calls("call"), [row["request_id"]])
+
+    def test_historical_reservation_without_creator_holds_original_gpu_budget(self):
+        block = {"capacity_mode": "audit", "gpu_cap": 2, "gpu_slots": 2,
+                 "queue": "research", "creator": "tester"}
+        self.configure_pool(launcher="volc", volc=block)
+        self.run_tick(100, "timeout")
+        row = self.row()
+        for key in ("capacity_units", "capacity_scope", "resource_creator"):
+            row.pop(key)
+        atomic_write_json(self.root / "workers" / (row["worker_id"] + ".json"), row)
+        (self.root / "jobs" / "job" / "STOP").touch()
+        self.job("second", pool="q")
+        atomic_write_json(self.root / "pools.json", {"pools": {
+            "p": self.pool, "q": dict(self.pool, volc=dict(block, creator="other")),
+        }})
+        self.run_tick(1000, "invisible")
+        self.assertEqual(self.row()["submission_state"], "uncertain")
+        self.assertEqual(self.calls("call"), [row["request_id"]])
 
     def test_capacity_query_error_does_not_block_another_pool(self):
         atomic_write_json(self.root / "pools.json", {"pools": {"p": self.pool, "q": self.pool}})

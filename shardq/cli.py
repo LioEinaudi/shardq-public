@@ -10,7 +10,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -18,6 +17,7 @@ from typing import Dict, List, Optional
 from .backend_exec import run_backend_op
 from .controller import run_scheduler
 from .fs import atomic_output, atomic_write_text
+from .launchers import get_launcher
 from .ledger import Ledger, atomic_write_json, read_json
 from .merge import merge_partition
 from .register import register
@@ -25,6 +25,7 @@ from .spec import (
     JOB_ID_RE,
     PoolSpec,
     load_pools,
+    pool_from_dict,
     resolve_pools_path,
     resolve_root,
 )
@@ -188,7 +189,7 @@ def lmms_merge_check(
                     "model": "",
                     "bootstrap_iters": 0,
                 },
-                "pool": asdict(pool),
+                "pool": pool.snapshot(),
                 "pins": {
                     "lmms_root": str(root),
                     "lmms_commit": proc.stdout.strip(),
@@ -268,7 +269,13 @@ def _publish(root: Path, job_id: str, out_dir: Path) -> dict:
         artifacts.append(row)
 
     pins = job.spec.get("pins") or {}
-    pool = job.spec.get("pool_snapshot") or {}
+    source = pins.get("execution_source")
+    if source is None:
+        snapshot = job.spec.get("pool_snapshot")
+        source = {}
+        if snapshot:
+            pool = pool_from_dict(job.pool, snapshot)
+            source = get_launcher(pool.launcher).execution_source(pool)
     status = (
         "partial"
         if any(
@@ -287,7 +294,8 @@ def _publish(root: Path, job_id: str, out_dir: Path) -> dict:
         ),
         "columns": [job.column],
         "protocol_by_column": {job.column: job.spec["protocol_id"]},
-        "queue": (pool.get("volc") or {}).get("queue"),
+        "queue": source.get("queue"),
+        "execution_source": source,
         "canonical_lmms_root": pins.get("lmms_root"),
         "source_revisions": {
             "control_commit": pins.get("control_commit"),
@@ -351,7 +359,8 @@ def build_parser() -> argparse.ArgumentParser:
     scheduler = commands.add_parser("scheduler")
     _add_config_args(scheduler)
     scheduler.add_argument(
-        "--launcher", choices=["volc", "local", "aihc"], default="volc"
+        "--launcher", metavar="NAME",
+        help="only manage pools with this launcher (alias or module:Class); default: all pools"
     )
     scheduler.add_argument("--poll-seconds", type=int, default=60)
     scheduler.add_argument("--once", action="store_true")
@@ -449,6 +458,8 @@ def main(argv: List[str] = None) -> int:
             return 0
 
         if args.command == "scheduler":
+            if args.launcher is not None:
+                get_launcher(args.launcher)
             if (
                 args.poll_seconds <= 0
                 or args.max_submits_per_tick <= 0

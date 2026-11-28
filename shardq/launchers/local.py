@@ -36,6 +36,14 @@ def local_process_handle(pid: int) -> str:
 
 class LocalLauncher(Launcher):
     name = "local"
+    initial_status = "running"
+
+    @classmethod
+    def startup_receipt(cls):
+        try:
+            return {"local_handle": local_process_handle(os.getpid())}
+        except (OSError, ValueError, IndexError) as error:
+            return {"identity_error": str(error)}
 
     def __init__(self, root: Path, pool, repo_root: Path) -> None:
         super().__init__(root, pool, repo_root)
@@ -72,7 +80,7 @@ class LocalLauncher(Launcher):
         workers = self.root / "workers"
         row = json.loads((workers / f"{worker_id}.json").read_text(encoding="utf-8"))
         if not row.get("request_id") or (row["worker_id"], row["pool"], row["launcher"]) != (
-            worker_id, self.pool.name, self.name
+            worker_id, self.pool.name, self.pool.launcher
         ):
             raise ValueError(f"invalid local submission identity for {worker_id}")
         handles = set()

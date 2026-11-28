@@ -1,0 +1,7 @@
+{
+  "job_id": "local-threads-demo",
+  "pool": "cpu",
+  "backend": "fake",
+  "protocol_id": "demo-v1",
+  "backend_args": {"partitions": {"sample": 4}, "unit_seconds": 0.01}
+}

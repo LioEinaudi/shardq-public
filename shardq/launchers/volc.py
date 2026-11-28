@@ -9,11 +9,32 @@ from typing import Dict, List, Optional
 from ..fs import atomic_write_text
 from ..ledger import read_json
 from . import volc_client
-from .base import Launcher, SubmissionChangedError
+from .base import Admission, Launcher, SubmissionChangedError
 
 
 class VolcLauncher(Launcher):
     name = "volc"
+    initial_status = "queued"
+    admission_only_args = ("max_queued", "gpu_cap", "capacity_mode")
+
+    @classmethod
+    def admission(cls, pool, available_slots):
+        args = pool.launcher_args
+        queue_limit = args.get("max_queued", 0 if available_slots is None else None)
+        scope = ("volc", str(args.get("queue", "")))
+        if args.get("creator") is not None:
+            scope += (str(args["creator"]),)
+        return Admission(
+            units_per_worker=int(args.get("gpu_slots", 1)),
+            scope=scope,
+            max_queued=int(queue_limit) if queue_limit is not None else None,
+            recheck_shared_capacity=args.get("capacity_mode") == "audit",
+        )
+
+    @classmethod
+    def execution_source(cls, pool):
+        args = pool.launcher_args
+        return {key: args.get(key) for key in ("image", "flavor", "queue")}
 
     def _entrypoint(self, env: Dict[str, str]) -> str:
         combined = {str(key): str(value) for key, value in self.pool.env.items()}
@@ -31,7 +52,7 @@ class VolcLauncher(Launcher):
         return f"{assignments} {command}".strip()
 
     def _template_text(self) -> str:
-        configured = self.pool.volc.get("template")
+        configured = self.pool.launcher_args.get("template")
         if configured:
             return Path(str(configured)).expanduser().read_text(
                 encoding="utf-8"
@@ -54,15 +75,15 @@ class VolcLauncher(Launcher):
                 f"ShardQ preemptible worker for pool {self.pool.name}"
             ),
             "ENTRYPOINT": self._entrypoint(env),
-            "QUEUE": self.pool.volc["queue"],
-            "FLAVOR": self.pool.volc["flavor"],
-            "IMAGE": self.pool.volc["image"],
+            "QUEUE": self.pool.launcher_args["queue"],
+            "FLAVOR": self.pool.launcher_args["flavor"],
+            "IMAGE": self.pool.launcher_args["image"],
             "PREEMPTIBLE": str(
-                bool(self.pool.volc.get("preemptible", True))
+                bool(self.pool.launcher_args.get("preemptible", True))
             ).lower(),
-            "PRIORITY": int(self.pool.volc.get("priority", 4)),
+            "PRIORITY": int(self.pool.launcher_args.get("priority", 4)),
             "ACTIVE_DEADLINE": self.pool.worker_max_wall_seconds + 1800,
-            "VEPFS_ID": self.pool.volc["vepfs_id"],
+            "VEPFS_ID": self.pool.launcher_args["vepfs_id"],
         }
         template = self._template_text()
         if env.get("SHARDQ_REQUEST_ID"):
@@ -88,11 +109,11 @@ class VolcLauncher(Launcher):
         volc_client.cancel(handle)
 
     def capacity_slots(self) -> Optional[int]:
-        if self.pool.volc.get("capacity_mode", "probe") != "audit":
+        if self.pool.launcher_args.get("capacity_mode", "probe") != "audit":
             return None
-        queue = str(self.pool.volc["queue"])
-        creator = str(self.pool.volc["creator"])
-        gpu_cap = int(self.pool.volc["gpu_cap"])
+        queue = str(self.pool.launcher_args["queue"])
+        creator = str(self.pool.launcher_args["creator"])
+        gpu_cap = int(self.pool.launcher_args["gpu_cap"])
         used = volc_client.requested_gpu_slots(
             volc_client.list_tasks(queue, creator)
         )

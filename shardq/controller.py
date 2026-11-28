@@ -5,9 +5,10 @@ import logging
 import math
 import sys
 import time
+from itertools import chain
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import shardq
 
@@ -16,6 +17,7 @@ from .fs import atomic_write_text
 from .launchers import get_launcher
 from . import submission
 from .launchers.base import Launcher
+from .launchers.reservations import read_reservation
 from .ledger import Ledger, ShardState, atomic_write_json, read_json
 from .merge import merge_partition
 from .spec import PoolSpec, load_pools, resolve_pools_path
@@ -42,12 +44,8 @@ def _launcher(root: Path, name: str, pool: PoolSpec):
     return _LAUNCHERS[key]
 
 
-def _launcher_block(pool: PoolSpec, launcher_name: str) -> dict:
-    if launcher_name == "volc":
-        return pool.volc
-    if launcher_name == "aihc":
-        return pool.aihc
-    return {}
+def _managed_pools(pools, launcher_name):
+    return {name for name, pool in pools.items() if launcher_name is None or pool.launcher == launcher_name}
 
 
 def _last_failure_reason(shard_dir: Path) -> str:
@@ -61,12 +59,19 @@ def _last_failure_reason(shard_dir: Path) -> str:
     return str(max(failures, key=lambda row: float(row.get("failed_unix", 0))).get("reason", "backend_error"))
 
 
-def _refresh_workers(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], now: float,
-                     pools_path: str = "") -> Dict[str, dict]:
-    managed_pools = {name for name, pool in pools.items() if pool.launcher == launcher_name}
-    # Switching a pool's launcher cannot discard a reservation in that pool.
-    records = [row for _, row in submission.worker_records(root) if row["launcher"] == launcher_name
-               or (row.get("pool") in managed_pools and submission.occupies(row))]
+def _refresh_workers(root: Path, launcher_name: Optional[str], pools: Dict[str, PoolSpec], now: float,
+                     pools_path: str = "", other_reservations=None) -> Dict[str, dict]:
+    managed_pools = _managed_pools(pools, launcher_name)
+    records = []
+    for _, row in submission.worker_records(root):
+        # Switching a pool's launcher cannot discard a reservation in that pool.
+        if (launcher_name is None or row["launcher"] == launcher_name
+                or (row.get("pool") in managed_pools and submission.occupies(row))):
+            records.append(row)
+        elif other_reservations is not None and row.get("submission_state") in submission.UNRESOLVED | {"intent"}:
+            # Explicit filtering disables polling and dispatch for other launchers.
+            # Their outstanding reservations can still charge a shared capacity scope.
+            other_reservations.append(row)
 
     def refresh(row):
         pool = pools.get(row.get("pool"))
@@ -80,7 +85,7 @@ def _refresh_workers(root: Path, launcher_name: str, pools: Dict[str, PoolSpec],
                 submission.save(root, row)
             return row
         try:
-            launcher = _launcher(root, launcher_name, pool)
+            launcher = _launcher(root, pool.launcher, pool)
         except Exception as exc:
             row["status_error"] = f"{type(exc).__name__}: {exc}"
             if row.get("submission_state") in {"submitting", "uncertain"} and now >= row.get("reconcile_after_unix", 0):
@@ -221,7 +226,7 @@ def _write_status(root: Path, state: dict) -> None:
 
 
 def _submit_workers(root, pool, pools_path, demand, workers, audit_waiters, backoff, max_submits,
-                    actions, warnings, now):
+                    actions, warnings, now, other_reservations=()):
     rows = [row for row in workers.values() if row["pool"] == pool.name]
     intents = [row for row in rows if row.get("submission_state") == "intent"]
     # A waiting intent already owns its place. Admit those identities first,
@@ -240,41 +245,39 @@ def _submit_workers(root, pool, pools_path, demand, workers, audit_waiters, back
         # Use this turn for recovered requests. Other waiting pools get their
         # turn before this pool can replenish with a fresh identity.
         count = min(count, len(intents))
-    block = _launcher_block(pool, pool.launcher)
-    gpu = int(block.get("gpu_slots", 1))
     try:
         launcher = _launcher(root, pool.launcher, pool)
         slots = launcher.capacity_slots()
+        if slots is not None and (type(slots) is not int or slots < 0):
+            raise ValueError("capacity_slots must return a nonnegative integer or None")
+        admission = get_launcher(pool.launcher).admission(pool, slots)
         inputs = launcher.submission_inputs()
     except Exception as exc:
         backoff[pool.name] = now + submission.RECONCILE_SECONDS
         warnings.append(f"{pool.name}: admission failed: {type(exc).__name__}: {exc}")
         return
-    if slots is not None and gpu > 0:
-        # Volc's audit budget is per queue/creator, which can span several
-        # ShardQ pools. Use the original request's domain even after a config edit.
+    if slots is not None and admission.units_per_worker:
+        # The provider may still be missing tasks with uncertain acknowledgements.
+        # Charge each recorded candidate in its original resource scope.
         reserved = 0
-        for row in workers.values():
+        for row in chain(workers.values(), other_reservations):
             state = row.get("submission_state")
             if state not in submission.UNRESOLVED and state != "intent":
                 continue
             if state == "intent" and (row["pool"] == pool.name or row["pool"] in audit_waiters):
-                # A saved audit intent must win a fresh capacity check before
-                # dispatch. Charging it here could make two such intents deadlock.
+                # Re-admit saved identities before fresh requests without deadlocking
+                # when two pools have saved intents for the last available slot.
                 continue
-            if row["pool"] != pool.name and not (
-                pool.launcher == row["launcher"] == "volc"
-                and row.get("resource_queue") == block.get("queue")
-                and row.get("resource_creator") in {None, block.get("creator")}
-            ):
-                continue
-            reserved += submission.occupies(row) * row.get("gpu_slots", gpu)
-        count = min(count, max(0, slots - reserved) // gpu)
-    if pool.launcher in {"volc", "aihc"} and (slots is None or "max_queued" in block):
+            scope, units = read_reservation(row, admission.units_per_worker)
+            same_budget = bool(scope) and admission.scope[:len(scope)] == scope
+            if row["pool"] == pool.name or same_budget:
+                reserved += submission.occupies(row) * units
+        count = min(count, max(0, slots - reserved) // admission.units_per_worker)
+    if admission.max_queued is not None:
         queued = sum(submission.occupies(row) for row in live if row.get("last_status") == "queued"
                      or row.get("submission_state") in submission.UNRESOLVED
                      or row.get("last_status") == "unknown")
-        count = min(count, max(0, int(block.get("max_queued", 0)) - queued))
+        count = min(count, max(0, admission.max_queued - queued))
     if not count:
         return
 
@@ -289,7 +292,7 @@ def _submit_workers(root, pool, pools_path, demand, workers, audit_waiters, back
                 submission.save(root, row)
                 batch.append(row)
     while len(batch) < count:
-        row = submission.intent(root, pool, inputs, pools_path, _package_root(), gpu, now)
+        row = submission.intent(root, pool, inputs, pools_path, _package_root(), admission, now)
         batch.append(row)
         workers[row["worker_id"]] = row
 
@@ -311,16 +314,17 @@ def _submit_workers(root, pool, pools_path, demand, workers, audit_waiters, back
                 warnings.append(f"{pool.name}: submit failed: {row['submission_error']}")
 
 
-def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict, now: float) -> dict:
+def tick(root: Path, launcher_name: Optional[str], pools: Dict[str, PoolSpec], opts: dict, now: float) -> dict:
     root = Path(root).resolve()
     ledger = Ledger(root)
     actions = []
     warnings = []
     tick_started = time.time()
     pools_path = str(opts.get("_pools_path") or "")
-    workers = _refresh_workers(root, launcher_name, pools, now, pools_path)
+    other_reservations = []
+    workers = _refresh_workers(root, launcher_name, pools, now, pools_path, other_reservations)
     workers_polled = sum(1 for row in workers.values() if row.get("last_checked_unix") == now)
-    relevant_pool_names = {name for name, pool in pools.items() if pool.launcher == launcher_name}
+    relevant_pool_names = _managed_pools(pools, launcher_name)
     job_ids = [
         job_id
         for job_id in ledger.list_jobs()
@@ -424,11 +428,16 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
     backoff = opts.setdefault("_pool_backoff", {})
     current_jobs = [ledger.scan_job(job_id, now) for job_id in job_ids]
     max_submits = int(opts.get("max_submits_per_tick", 4))
-    audit_waiters = {
-        row["pool"] for row in workers.values()
-        if row.get("submission_state") == "intent" and row["pool"] in relevant_pool_names
-        and launcher_name == "volc" and pools[row["pool"]].volc.get("capacity_mode") == "audit"
-    }
+    audit_waiters = set()
+    saved_pools = {row["pool"] for row in workers.values() if row.get("submission_state") == "intent"}
+    for pool_name in relevant_pool_names & saved_pools:
+        pool = pools[pool_name]
+        try:
+            if get_launcher(pool.launcher).admission(pool, None).recheck_shared_capacity:
+                audit_waiters.add(pool_name)
+        except Exception:
+            # Keep its reservation charged. The admission pass reports the error.
+            continue
     # The root lock serializes pools. Each pool finishes its batch before the
     # next one queries the provider and accounts for unresolved ledger rows.
     for pool_name in sorted(relevant_pool_names, key=lambda name: (name not in audit_waiters, name)):
@@ -437,7 +446,7 @@ def tick(root: Path, launcher_name: str, pools: Dict[str, PoolSpec], opts: dict,
                      for job in current_jobs if job.pool == pool_name and not job.claims_blocked
                      for part in job.partitions.values())
         _submit_workers(root, pool, pools_path, demand, workers, audit_waiters, backoff, max_submits,
-                        actions, warnings, now)
+                        actions, warnings, now, other_reservations)
 
     final_jobs = [ledger.scan_job(job_id, now) for job_id in job_ids]
     for job in final_jobs:
@@ -494,7 +503,7 @@ def _configure_logging(root: Path) -> None:
 
 def run_scheduler(
     root: Path,
-    launcher_name: str,
+    launcher_name: Optional[str],
     poll_seconds: int,
     once: bool,
     exit_when_idle: bool,

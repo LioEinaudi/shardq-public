@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable, List, Set
 
@@ -151,7 +150,7 @@ def merge_partition(
         {
             "backend": job.spec["backend"],
             "backend_args": job.spec.get("backend_args") or {},
-            "pool": asdict(pool),
+            "pool": pool.snapshot(),
             "pins": job.spec.get("pins") or {},
             "partition": {"name": partition, "size": view.size, "traits": {}},
             "records_file": str(records_file.resolve()),

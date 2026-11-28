@@ -321,7 +321,8 @@ A pools file has a top-level `pools` object. Each pool contains:
 
 - `backend`: built-in name or `module:Class`
 - `entry`: absolute container entry script; ignored by the local launcher
-- `launcher`: `local`, `volc` or `aihc`
+- `launcher`: `local`, `volc`, `aihc` or an importable `module:Class`
+- `launcher_args`: platform configuration. Legacy named blocks remain readable.
 - `volc`: queue, flavor, `gpu_slots`, image, preemptible, priority,
   `vepfs_id`, capacity mode, and capacity fields
 - `env`: worker environment additions
@@ -353,7 +354,7 @@ resolved-import proof.
 
 ```bash
 python -m shardq register SPEC.json [--pin-mode worktree|verify]
-python -m shardq scheduler [--launcher local|volc|aihc] [--exit-when-idle]
+python -m shardq scheduler [--launcher NAME] [--exit-when-idle]
 python -m shardq worker --pool POOL
 python -m shardq status [--job JOB] [--json]
 python -m shardq resolve-submission --worker-id ID (--handle H | --not-created | --terminal) --evidence TEXT
@@ -388,5 +389,5 @@ ShardQ remains dependency-free.
 
 Subclass `Launcher` and implement `submit`, `status`, and `kill`.
 `capacity_slots` may return an integer or `None` when capacity cannot be
-audited. Register the launcher name in `launchers.get_launcher`. Launchers
+audited. Select the class with `launcher: "module:Class"` and configure `launcher_args`. Launchers
 manage workers only; shard truth always remains in the shared ledger.

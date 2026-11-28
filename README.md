@@ -40,7 +40,10 @@ mkdir -p "$SHARDQ_ROOT/scheduler/log"
 tmux new -d -s shardq 'exec shardq scheduler --launcher volc --exit-when-idle >>"$SHARDQ_ROOT/scheduler/log/stdout.log" 2>>"$SHARDQ_ROOT/scheduler/log/stderr.log"' \; set-option -t shardq:0 remain-on-exit off
 ```
 
-Use the launcher for your pool (`local`, `volc`, or `aihc`). The scheduler exits
+Omit `--launcher` to serve all configured pools with one scheduler. An explicit
+`--launcher NAME` limits scheduling to pools using that exact alias or
+`module:Class`. Older releases defaulted to Volc. Add `--launcher volc` to
+existing unattended commands that should serve only Volc pools. The scheduler exits
 once runnable jobs are merged or partial, workers and leases have drained, and
 background merges have finished. A temporary setup backoff keeps the scheduler
 waiting. Stopped jobs and jobs paused after repeated setup failures can be
@@ -161,8 +164,10 @@ backend is convenient for command-line adapters.
 A cloud launcher subclasses `shardq.launchers.base.Launcher` and implements
 `submit`, `status`, and `kill`; implement `capacity_slots` when the cloud
 has auditable capacity. A launcher with complete request history can implement
-`lookup_submission` for automatic recovery. Add its name to
-`shardq.launchers.get_launcher`.
+`lookup_submission` for automatic recovery. Set `launcher` to the importable `module:Class` and put its options in
+`launcher_args`. Legacy `volc` and `aihc` blocks are also accepted. When both
+forms specify options for the selected launcher they must agree.
+[Runnable external launcher](examples/external_launcher/)
 
 ## Agent skill
 

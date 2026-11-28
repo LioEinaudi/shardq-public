@@ -8,13 +8,13 @@ import time
 import traceback
 import uuid
 from contextlib import contextmanager
-from dataclasses import asdict
 from pathlib import Path
 from typing import List, Optional
 
 from .backends import get_backend
 from .backends.base import RangeValidationError, WorkerRestartRequired
 from .fs import atomic_write_json
+from .launchers import get_launcher
 from .ledger import Claim, Ledger, ShardState, read_json
 from .spec import PoolSpec, load_pools, pool_from_dict, resolve_pools_path
 
@@ -95,13 +95,10 @@ def _record_start(root: Path, pool: PoolSpec, worker_id: str) -> None:
         "launcher": pool.launcher, "host": socket.gethostname(), "pid": os.getpid(),
         "started_unix": time.time(),
     }
-    if pool.launcher == "local":
-        from .launchers.local import local_process_handle
-
-        try:
-            receipt["local_handle"] = local_process_handle(os.getpid())
-        except (OSError, ValueError, IndexError) as error:
-            receipt["identity_error"] = str(error)
+    for key, value in get_launcher(pool.launcher).startup_receipt().items():
+        if key in receipt:
+            raise ValueError(f"launcher receipt cannot replace identity field {key!r}")
+        receipt[key] = value
     # Each process owns one receipt. A slow submit acknowledgement can only
     # update the scheduler's record, and duplicate starts remain observable.
     atomic_write_json(workers / f"{worker_id}.starts" / f"{uuid.uuid4().hex}.json", receipt)
@@ -191,7 +188,7 @@ def run_worker(
                 try:
                     backend = get_backend(str(job_spec["backend"]))(
                         dict(job_spec.get("backend_args") or {}),
-                        asdict(pool_spec),
+                        pool_spec.snapshot(),
                         dict(job_spec.get("pins") or {}),
                     )
                     # The saved key is an affinity hint and may predate the current backend.
