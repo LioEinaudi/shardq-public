@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import hashlib
 import shlex
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from ..fs import atomic_output, atomic_write_json
+from ..fs import sha256_file, atomic_output, atomic_write_json
 from . import aihc_client
 from .base import Admission, Launcher
 
@@ -30,7 +29,7 @@ class AihcLauncher(Launcher):
         path = self.pool.launcher_args.get("aihc_config")
         if not path:
             return {}
-        return {"config_sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
+        return {"config_sha256": sha256_file(Path(path))}
 
     def _entrypoint(self, env: Dict[str, str]) -> str:
         combined = {str(key): str(value) for key, value in self.pool.env.items()}

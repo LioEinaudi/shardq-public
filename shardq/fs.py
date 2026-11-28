@@ -48,6 +48,16 @@ def atomic_write_text(path: Path, content: str) -> None:
 def atomic_write_json(path: Path, payload: Any) -> None:
     atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
+
+def sha256_file(path: Path) -> str:
+    """Hash file contents with a fixed-size buffer."""
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(256 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def write_records(path: Path, rows: Iterable[dict]) -> str:
     """Publish UTF-8 JSONL and hash exactly the bytes written."""
     digest = hashlib.sha256()

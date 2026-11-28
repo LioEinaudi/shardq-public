@@ -126,47 +126,67 @@ def _run_merge(root: Path, job, partition: str, pool: PoolSpec, allow_partial: b
         raise
 
 
-def _update_history(root: Path, jobs: list, now: float, actions: list) -> None:
+def _history_sample(path, cached):
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    stamp = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    if cached and cached[0] == stamp:
+        return cached
+    complete = read_json(path, {})
+    count = int(complete.get("count", 0))
+    if count <= 0:
+        return None
+    return stamp, (float(complete.get("completed_unix", 0)), str(path),
+                   float(complete.get("elapsed_seconds", 0)), count)
+
+
+def _update_history(root: Path, jobs: list, now: float, actions: list, cache=None) -> None:
     history_path = root / "history.json"
     history = read_json(history_path, {})
     if not isinstance(history, dict):
         history = {}
-    events = {}
-    partition_paths = {}
+    if cache is None:
+        cache = {}
+    groups = {}
     for job in jobs:
-        backend = str(job.spec["backend"])
-        session_key = str(job.spec.get("session_key", ""))
         for partition in job.partitions.values():
-            key = f"{backend}:{session_key}:{partition.name}"
+            key = f"{job.spec['backend']}:{job.spec.get('session_key', '')}:{partition.name}"
             partition_dir = root / "jobs" / job.job_id / "partitions" / partition.name
-            partition_paths.setdefault(key, []).append((partition_dir / "partition.json", partition.unit_seconds_est))
+            partitions, paths = groups.setdefault(key, ([], []))
+            partitions.append((partition_dir / "partition.json", partition.unit_seconds_est))
             for shard in partition.shards:
-                shard_dir = partition_dir / "shards" / shard.shard_id
-                for complete_path in sorted((shard_dir / "attempts").glob("*/complete.json")):
-                    complete = read_json(complete_path, {})
-                    count = int(complete.get("count", 0))
-                    if count <= 0:
-                        continue
-                    events.setdefault(key, []).append(
-                        (
-                            float(complete.get("completed_unix", 0)),
-                            str(complete_path),
-                            float(complete.get("elapsed_seconds", 0)),
-                            count,
-                        )
-                    )
+                attempts = partition_dir / "shards" / shard.shard_id / "attempts"
+                paths.extend(attempts / attempt / "complete.json" for attempt in shard.complete_attempts)
 
     changed = False
-    for key, rows in events.items():
-        rebuilt = {}
-        for completed_unix, identity, elapsed, count in sorted(rows):
-            update_history(rebuilt, key, elapsed, count, completed_unix or now)
-        if history.get(key) != rebuilt[key]:
-            history[key] = rebuilt[key]
+    for key in cache.keys() - groups.keys():
+        del cache[key]
+    for key, (partitions, paths) in groups.items():
+        previous, summary = cache.get(key, ({}, {}))
+        samples = {}
+        for path in paths:
+            sample = _history_sample(path, previous.get(path))
+            if sample is not None:
+                samples[path] = sample
+        if samples != previous:
+            # A replay may arrive with an earlier completion time. Recompute the
+            # affected EMA in the original deterministic order, including ties.
+            rebuilt = {}
+            for completed, identity, elapsed, count in sorted(event for stamp, event in samples.values()):
+                update_history(rebuilt, key, elapsed, count, completed)
+            summary = rebuilt.get(key, {})
+        cache[key] = samples, summary
+        if not summary:
+            continue
+        current = dict(summary, updated_unix=summary["updated_unix"] or now)
+        if history.get(key) != current:
+            history[key] = current
             changed = True
-            actions.append({"action": "history", "key": key, "attempts": len(rows)})
-        estimate = float(rebuilt[key]["unit_seconds"])
-        for metadata_path, previous_estimate in partition_paths.get(key, []):
+            actions.append({"action": "history", "key": key, "attempts": len(samples)})
+        estimate = float(current["unit_seconds"])
+        for metadata_path, previous_estimate in partitions:
             if previous_estimate != estimate:
                 Ledger.update_partition(metadata_path, unit_seconds_est=estimate)
     if changed or not history_path.exists():
@@ -331,13 +351,22 @@ def tick(root: Path, launcher_name: Optional[str], pools: Dict[str, PoolSpec], o
         if str(read_json(ledger.job_dir(job_id) / "job.json", {}).get("pool")) in relevant_pool_names
     ]
 
+    # Only reuse fully drained job views between phases of this tick. A
+    # manually published partial partition may still have uncut or live work.
+    drained = {}
     for job_id in job_ids:
         job = ledger.scan_job(job_id, now)
+        if all(part.status in {"merged", "partial"} and part.next_cut == part.size
+               and not (part.pending or part.backoff or any(s.lease_present for s in part.shards))
+               for part in job.partitions.values()):
+            drained[job_id] = job
+            continue
         ttl = int((job.spec.get("retry") or {}).get("lease_ttl_seconds", 900))
-        for shard_id in ledger.expire_leases(job_id, ttl, lambda owner: _owner_alive(workers, job.pool, owner), now):
+        for shard_id in ledger._expire_scanned_leases(job, ttl, lambda owner: _owner_alive(workers, job.pool, owner), now):
             actions.append({"action": "expire", "job_id": job_id, "shard_id": shard_id})
 
-    for job_id in job_ids:
+    active_ids = [job_id for job_id in job_ids if job_id not in drained]
+    for job_id in active_ids:
         job = ledger.scan_job(job_id, now)
         retry = job.spec.get("retry") or {}
         max_depth = int(math.ceil(math.log(max(1, int((job.spec.get("shard") or {}).get("max_units", 1))), 2)))
@@ -357,11 +386,11 @@ def tick(root: Path, launcher_name: Optional[str], pools: Dict[str, PoolSpec], o
                     ledger.quarantine(job_id, shard.shard_id, reason, now)
                     actions.append({"action": "quarantine", "job_id": job_id, "shard_id": shard.shard_id, "reason": reason})
 
-    jobs = [ledger.scan_job(job_id, now) for job_id in job_ids]
-    _update_history(root, jobs, now, actions)
+    jobs = [drained.get(job_id) or ledger.scan_job(job_id, now) for job_id in job_ids]
+    _update_history(root, jobs, now, actions, opts.setdefault("_history_cache", {}))
 
     max_cuts = int(opts.get("max_cuts_per_tick", 64))
-    for job_id in job_ids:
+    for job_id in active_ids:
         job = ledger.scan_job(job_id, now)
         if job.claims_blocked:
             continue
@@ -404,7 +433,7 @@ def tick(root: Path, launcher_name: Optional[str], pools: Dict[str, PoolSpec], o
             merge_retry_after[key] = now + MERGE_RETRY_SECONDS
             warnings.append(f"{key[0]}:{key[1]}: merge failed: {type(exc).__name__}: {exc}")
 
-    for job_id in job_ids:
+    for job_id in active_ids:
         job = ledger.scan_job(job_id, now)
         pool = pools[job.pool]
         for name, partition in job.partitions.items():
@@ -426,7 +455,7 @@ def tick(root: Path, launcher_name: Optional[str], pools: Dict[str, PoolSpec], o
             actions.append({"action": "merge_start", "job_id": job_id, "partition": name})
 
     backoff = opts.setdefault("_pool_backoff", {})
-    current_jobs = [ledger.scan_job(job_id, now) for job_id in job_ids]
+    current_jobs = [ledger.scan_job(job_id, now) for job_id in active_ids]
     max_submits = int(opts.get("max_submits_per_tick", 4))
     audit_waiters = set()
     saved_pools = {row["pool"] for row in workers.values() if row.get("submission_state") == "intent"}

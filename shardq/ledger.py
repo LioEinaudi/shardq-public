@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
@@ -13,7 +12,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .fs import atomic_write_json, atomic_write_text as _atomic_write_text, file_lock
+from .fs import sha256_file, atomic_write_json, atomic_write_text as _atomic_write_text, file_lock
 from .spec import JOB_ID_RE, slug
 
 
@@ -124,31 +123,45 @@ def read_json(path: Path, default: Any = None) -> Any:
         return default
 
 
-def _attempt_failures(shard_dir: Path) -> List[dict]:
-    rows = []
-    for path in sorted((shard_dir / "attempts").glob("*/failed.json")):
-        payload = read_json(path, {})
-        if isinstance(payload, dict):
-            rows.append(payload)
-    return rows
+def _attempt_outcomes(shard_dir: Path) -> Tuple[List[str], List[dict]]:
+    try:
+        attempts = sorted((shard_dir / "attempts").iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        return [], []
+    completed = []
+    failures = []
+    for attempt in attempts:
+        if (attempt / "complete.json").is_file():
+            completed.append(attempt.name)
+        failure = read_json(attempt / "failed.json")
+        if isinstance(failure, dict):
+            failures.append(failure)
+    return completed, failures
 
 
-def shard_state(shard_dir: Path, now: float) -> ShardState:
+def _retry_after(failures: List[dict]) -> float:
+    latest = max(
+        (row for row in failures if row.get("reason") not in {"session_error", "worker_restart"}),
+        key=lambda row: float(row.get("failed_unix", 0)), default={},
+    )
+    return float(latest.get("retry_after_unix", 0))
+
+
+def _state(shard_dir: Path, completed: List[str], leased: bool, backoff: bool) -> ShardState:
     if (shard_dir / "superseded.json").is_file():
         return ShardState.SUPERSEDED
-    if any((shard_dir / "attempts").glob("*/complete.json")):
+    if completed:
         return ShardState.DONE
     if (shard_dir / "quarantine.json").is_file():
         return ShardState.QUARANTINED
-    if os.path.lexists(shard_dir / "lease"):
+    if leased:
         return ShardState.LEASED
-    failures = [row for row in _attempt_failures(shard_dir)
-                if row.get("reason") not in {"session_error", "worker_restart"}]
-    if failures:
-        latest = max(failures, key=lambda row: float(row.get("failed_unix", 0)))
-        if float(latest.get("retry_after_unix", 0)) > now:
-            return ShardState.PENDING_BACKOFF
-    return ShardState.PENDING
+    return ShardState.PENDING_BACKOFF if backoff else ShardState.PENDING
+
+
+def shard_state(shard_dir: Path, now: float) -> ShardState:
+    completed, failures = _attempt_outcomes(shard_dir)
+    return _state(shard_dir, completed, os.path.lexists(shard_dir / "lease"), _retry_after(failures) > now)
 
 
 def _read_heartbeat(path: Path) -> Optional[float]:
@@ -216,33 +229,29 @@ class Ledger:
 
     def _scan_shard(self, shard_dir: Path, now: float, setup_epoch: str) -> ShardView:
         metadata = read_json(shard_dir / "shard.json", {})
-        failures = _attempt_failures(shard_dir)
+        completed, failures = _attempt_outcomes(shard_dir)
         errors = sum(row.get("reason") in SAMPLE_ERROR_REASONS for row in failures)
         preemptions = sum(str(row.get("reason")) in PREEMPTION_REASONS for row in failures)
         setup_failures = [
             row for row in failures
             if row.get("reason") == "session_error" and row.get("setup_epoch", "") == setup_epoch
         ]
-        latest_failure = max(
-            (row for row in failures if row.get("reason") not in {"session_error", "worker_restart"}),
-            key=lambda row: float(row.get("failed_unix", 0)), default={},
-        )
-        retry_after = float(latest_failure.get("retry_after_unix", 0))
+        retry_after = _retry_after(failures)
         lease = shard_dir / "lease"
-        completed = sorted(path.parent.name for path in (shard_dir / "attempts").glob("*/complete.json"))
+        lease_present = os.path.lexists(lease)
         return ShardView(
             shard_id=str(metadata.get("shard_id", shard_dir.name)),
             partition=str(metadata.get("partition", "")),
             start=int(metadata.get("start", 0)),
             count=int(metadata.get("count", 0)),
-            state=shard_state(shard_dir, now),
+            state=_state(shard_dir, completed, lease_present, retry_after > now),
             errors=errors,
             preemptions=preemptions,
             retry_after_unix=retry_after,
             depth=int(metadata.get("depth", 0)),
-            lease_owner=_lease_owner(lease),
-            lease_present=os.path.lexists(lease),
-            heartbeat_unix=_read_heartbeat(lease / "heartbeat"),
+            lease_owner=_lease_owner(lease) if lease_present else None,
+            lease_present=lease_present,
+            heartbeat_unix=_read_heartbeat(lease / "heartbeat") if lease_present else None,
             complete_attempts=completed,
             session_errors=len(setup_failures),
             session_retry_after_unix=max((float(row.get("retry_after_unix", 0)) for row in setup_failures), default=0.0),
@@ -474,7 +483,7 @@ class Ledger:
             "completed_unix": now,
             "elapsed_seconds": elapsed_seconds,
             "count": count,
-            "records_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+            "records_sha256": sha256_file(target),
             "backend_extra": backend_extra,
         }
         with file_lock(claim.shard_dir / "lease.lock"):
@@ -560,14 +569,18 @@ class Ledger:
         is_alive: Callable[[dict], bool],
         now: float,
     ) -> List[str]:
+        return self._expire_scanned_leases(self.scan_job(job_id, now), ttl_seconds, is_alive, now)
+
+    def _expire_scanned_leases(
+        self, job: JobView, ttl_seconds: int, is_alive: Callable[[dict], bool], now: float
+    ) -> List[str]:
         expired = []
-        job = self.scan_job(job_id, now)
         for partition in job.partitions.values():
             for shard in partition.shards:
                 # A late completion may mask another live lease in shard.state.
                 if not shard.lease_present:
                     continue
-                shard_dir = self.job_dir(job_id) / "partitions" / partition.name / "shards" / shard.shard_id
+                shard_dir = self.job_dir(job.job_id) / "partitions" / partition.name / "shards" / shard.shard_id
                 if self._expire_lease(shard_dir, shard, ttl_seconds, is_alive, now):
                     expired.append(shard.shard_id)
         return expired
@@ -661,7 +674,7 @@ class Ledger:
 
     def quarantine(self, job_id: str, shard_id: str, reason: str, now: float) -> None:
         shard_dir, _ = self._find_shard(job_id, shard_id)
-        failures = _attempt_failures(shard_dir)
+        _, failures = _attempt_outcomes(shard_dir)
         atomic_write_json(
             shard_dir / "quarantine.json",
             {

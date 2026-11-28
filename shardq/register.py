@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import subprocess
 import time
 from dataclasses import asdict
@@ -12,6 +11,7 @@ from .backend_exec import run_backend_op
 from .backends import get_backend
 from .cutter import estimate_unit_seconds
 from .launchers import get_launcher
+from .fs import sha256_file
 from .ledger import atomic_write_json, read_json
 from .spec import (
     JOB_ID_RE,
@@ -128,7 +128,7 @@ def register(
             "session_key": session_key,
             "registered_unix": time.time(),
             "spec_file": str(spec_path.resolve()),
-            "spec_sha256": hashlib.sha256(spec_path.read_bytes()).hexdigest(),
+            "spec_sha256": sha256_file(spec_path),
         }
     )
     job_payload["backend_report"] = backend_class.report_metadata(job_payload)

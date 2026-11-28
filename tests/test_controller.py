@@ -212,6 +212,13 @@ class CutAndSubmitTest(unittest.TestCase):
         self.assertEqual([action for action in state["actions"] if action["action"] == "cut"], [])
         self.assertEqual(state["shards_cut"], 0)
 
+    def test_partial_publication_with_uncut_units_still_supplies_work(self) -> None:
+        self._configure_shards(lookahead=2)
+        self.ledger.set_partition_status(self.job_id, self.partition, "partial")
+        state = controller.tick(self.root, "local", self.pools, self.opts, time.time())
+        self.assertEqual(state["shards_cut"], 2)
+        self.assertGreater(state["workers_submitted"], 0)
+
     def test_cut_respects_max_cuts_per_tick(self) -> None:
         self._configure_shards(lookahead=1000)
         self.pool.max_workers = 0
