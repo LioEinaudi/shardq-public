@@ -101,6 +101,9 @@ setup budget with the original partition ranges and attempt history.
 **Interrupted worker submissions.** Before contacting a launcher, the scheduler
 records a worker ID and reserves capacity in `workers/<worker_id>.json`.
 Restart the scheduler with the same ledger, pools file and provider account.
+Keep the deployed package path, interpreter, entry scripts and worker environment
+stable when recovering recorded requests. A changed execution fingerprint
+requires inspection of the original request.
 It resumes unused intents and reconciles calls that may have reached the
 platform. An unresolved request keeps its pool slot and keeps
 `--exit-when-idle` waiting. A worker may start and renew leases while its
@@ -138,6 +141,10 @@ and atomic same-directory file rename. A worker publishes a fully initialized
 lease with one link creation. The scheduler can also recover incomplete leases
 left by earlier versions after a two-TTL grace period. The deployment assumptions
 and recovery rules are in [the design](docs/design.md#ledger-and-state-semantics).
+
+Finished batches can keep their ledger at its original absolute path and use a
+fresh root for the next batch. The retained ledger stays available for status
+and publication. [Draining and retaining a batch](docs/archiving.md)
 
 ## Volc
 
@@ -195,6 +202,8 @@ has auditable capacity. A launcher with complete request history can implement
 `launcher_args`. Legacy `volc` and `aihc` blocks are also accepted. When both
 forms specify options for the selected launcher they must agree.
 [Runnable external launcher](examples/external_launcher/)
+
+[Local performance measurements and reproduction](docs/performance.md)
 
 ## Agent skill
 

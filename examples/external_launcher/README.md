@@ -13,9 +13,9 @@ in both the scheduler and worker environments.
 export PYTHONPATH="$PWD/examples/external_launcher${PYTHONPATH:+:$PYTHONPATH}"
 export SHARDQ_ROOT="$(mktemp -d)"
 export SHARDQ_POOLS="$PWD/examples/external_launcher/pools.json"
-python -m shardq register examples/external_launcher/job.json
-python -m shardq scheduler --poll-seconds 1 --exit-when-idle
-python -m shardq status --job local-threads-demo
+python3 -m shardq register examples/external_launcher/job.json
+python3 -m shardq scheduler --poll-seconds 1 --exit-when-idle
+python3 -m shardq status --job local-threads-demo
 cat "$SHARDQ_ROOT/jobs/local-threads-demo/merged/sample/records.jsonl"
 ```
 

@@ -50,7 +50,11 @@ resources. `register --dry-run` must be read-only. Return a tuple of import
 roots from `control_pythonpath(pool, pins)` to request a fresh process for
 control operations. An empty tuple requests isolation with ordinary imports.
 The default allows in-process execution with the control interpreter.
-`report_metadata(job_spec)` can record backend provenance at registration.
+`report_metadata(job_spec)` returns an optional dict of `marker`, `run` and
+`source_revisions` fields. Registration freezes these values for offline
+publication. Common identity, status and checksum fields take precedence.
+New registrations emit schema 2 markers and `run.json`. The v1 export path
+for earlier jobs preserves their original lmms fields.
 
 ## Launcher and recovery
 

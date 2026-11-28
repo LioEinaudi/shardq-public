@@ -2,7 +2,7 @@
 
 ## Purpose
 
-ShardQ cuts a benchmark's leaf partitions into contiguous ranges sized by
+ShardQ cuts an offline job's known-size partitions into contiguous ranges sized by
 estimated runtime. Short-lived workers claim ranges from a shared filesystem
 ledger, write per-unit records, and may disappear without holding authoritative
 in-memory state. Repeated failures are bisected until a poison unit is isolated
@@ -317,7 +317,8 @@ writers cannot enforce this protocol.
 
 ## Pool configuration
 
-A pools file has a top-level `pools` object. Each pool contains:
+One scheduler manages all configured pools by default. Pass `--launcher volc`
+to keep the earlier implicit Volc filter. A pools file has a top-level `pools` object. Each pool contains:
 
 - `backend`: built-in name or `module:Class`
 - `entry`: absolute container entry script; ignored by the local launcher
@@ -371,7 +372,7 @@ All commands accept `--root` and `--pools`. Root resolution is CLI, then
 `SHARDQ_ROOT`, then error. Pools resolution is CLI, then `SHARDQ_POOLS`, then
 `<root>/pools.json` when it exists, then error.
 
-`publish` writes a self-contained evidence directory: `run.json`,
+`publish` writes a directory of evidence referencing the shared ledger: `run.json`,
 `artifacts.json`, `acceptance.json`, `summary.md`, and marker copies under
 `state/full/<column>/`.
 
