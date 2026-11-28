@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Iterable, List, Set
 
+from .backends.reports import attempt_report, report_for_job
 from .backend_exec import run_backend_op
 from .fs import write_records
 from .ledger import JobView, Ledger, PartitionView, ShardState, atomic_write_json, read_json
@@ -34,11 +35,11 @@ def select_attempts(partition_view: PartitionView, shards_root: Path) -> List[di
         extra = complete.get("backend_extra") or {}
         selected.append(
             {
+                **attempt_report(extra),
                 "shard_id": shard.shard_id,
                 "attempt_id": attempt_id,
                 "handle": complete.get("handle", ""),
                 "elapsed_seconds": float(complete.get("elapsed_seconds", 0)),
-                "raw_results": extra.get("raw_results"),
                 "records_file": str(records_file.resolve()),
                 "complete_file": str((attempt_dir / "complete.json").resolve()),
             }
@@ -70,31 +71,6 @@ def coverage(records: List[dict], size: int, quarantined_units: Set[int]) -> dic
         "missing_units": sorted(expected - present),
         "extra_units": sorted(present - expected),
     }
-
-
-def _parse_generation_kwargs(value: object) -> dict:
-    if isinstance(value, dict):
-        return dict(value)
-    if not isinstance(value, str) or not value.strip():
-        return {}
-    result = {}
-    for item in value.split(","):
-        if "=" not in item:
-            continue
-        key, raw = item.split("=", 1)
-        raw = raw.strip()
-        if raw.lower() in {"true", "false"}:
-            parsed = raw.lower() == "true"
-        else:
-            try:
-                parsed = int(raw)
-            except ValueError:
-                try:
-                    parsed = float(raw)
-                except ValueError:
-                    parsed = raw
-        result[key.strip()] = parsed
-    return result
 
 
 def merge_partition(
@@ -168,16 +144,21 @@ def merge_partition(
     )
     elapsed_sum = sum(float(item["elapsed_seconds"]) for item in selected)
     public_selected = [
-        {key: item.get(key) for key in ("shard_id", "attempt_id", "handle", "elapsed_seconds", "raw_results")}
+        {key: value for key, value in item.items() if key not in {"records_file", "complete_file"}}
         for item in selected
     ]
+    state = "partial" if missing else "complete"
+    artifacts = dict(backend_meta["artifacts"], results={
+        "path": str(results_file.resolve()), "sha256": hashlib.sha256(results_file.read_bytes()).hexdigest(),
+    })
     merge_payload = {
+        "status": state,
         "job_id": job.job_id,
         "partition": partition,
         "size": view.size,
         "effective": completed,
         "record_count": len(records),
-        "artifacts": backend_meta["artifacts"],
+        "artifacts": artifacts,
         "missing_units": missing,
         "quarantined_shards": quarantined_shards,
         "shards_used": public_selected,
@@ -187,16 +168,17 @@ def merge_partition(
         "sampling_note": (
             "complete contiguous shard coverage"
             if not missing
-            else f"data gap: {len(missing)} missing units; partial result is not headline-eligible"
+            else f"data gap: {len(missing)} missing units"
         ),
         "selfcheck": backend_result.get("selfcheck", {"shards_checked": 0, "mismatches": []}),
         "merged_unix": now,
     }
     atomic_write_json(out_dir / "merge.json", merge_payload)
-    state = "partial" if missing else "complete"
     marker_dir = job_dir / "markers" / job.column
     marker = {
-        "schema_version": 1,
+        **report_for_job(job.spec).get("marker", {}),
+        "artifacts": artifacts,
+        "schema_version": 2 if "backend_report" in job.spec else 1,
         "status": state,
         "task": partition,
         "column": job.column,
@@ -205,10 +187,6 @@ def merge_partition(
         "result_file": str(results_file.resolve()),
         "output_dir": str(out_dir.resolve()),
         "backend": job.spec["backend"],
-        "batch_size": (job.spec.get("backend_args") or {}).get("batch_size"),
-        "generation_kwargs": _parse_generation_kwargs((job.spec.get("backend_args") or {}).get("gen_kwargs")),
-        "num_processes": 1,
-        "canonical_source_proof": (job.spec.get("pins") or {}).get("canonical_source_proof"),
         "protocol_id": job.spec["protocol_id"],
         "shardq": {
             "job_id": job.job_id,

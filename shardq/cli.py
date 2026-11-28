@@ -6,15 +6,13 @@ import json
 import multiprocessing
 import os
 import shutil
-import subprocess
 import sys
-import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .backend_exec import run_backend_op
+from .backends.reports import report_for_job
 from .controller import run_scheduler
 from .fs import atomic_output, atomic_write_text
 from .launchers import get_launcher
@@ -23,7 +21,6 @@ from .merge import merge_partition
 from .register import register
 from .spec import (
     JOB_ID_RE,
-    PoolSpec,
     load_pools,
     pool_from_dict,
     resolve_pools_path,
@@ -101,136 +98,11 @@ def selftest_fs(root: Path, procs: int, rounds: int) -> dict:
     }
 
 
-def _public_scalars(metrics: dict) -> dict:
-    return {
-        str(key): value
-        for key, value in metrics.items()
-        if key != "alias"
-        and "stderr" not in str(key).lower()
-        and not str(key).lower().startswith("submission")
-        and isinstance(value, (int, float, str, bool))
-    }
+def lmms_merge_check(samples_path: Path, results_path: Path, lmms_root: Path, local_python: Path) -> dict:
+    """Compatibility entry point for the optional lmms fixture checker."""
+    from .backends.lmms_reports import lmms_merge_check as check
 
-
-def lmms_merge_check(
-    samples_path: Path,
-    results_path: Path,
-    lmms_root: Path,
-    local_python: Path,
-) -> dict:
-    root = Path(lmms_root).expanduser().resolve()
-    python = Path(local_python).expanduser().resolve()
-    if not root.is_dir():
-        raise ValueError(f"lmms root is not a directory: {root}")
-    if not python.is_file() or not os.access(python, os.X_OK):
-        raise ValueError(f"local python is not executable: {python}")
-    proc = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "HEAD"],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if proc.returncode:
-        raise RuntimeError(f"cannot resolve lmms commit: {proc.stderr.strip()}")
-    expected_payload = json.loads(
-        Path(results_path).read_text(encoding="utf-8")
-    )
-    task_names = list((expected_payload.get("results") or {}).keys())
-    if len(task_names) != 1:
-        raise ValueError(
-            f"expected exactly one task in results file, got {task_names}"
-        )
-    task = task_names[0]
-    rows = []
-    for line in Path(samples_path).read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        row = json.loads(line)
-        row["unit_id"] = int(row["doc_id"])
-        rows.append(row)
-    counts = (
-        expected_payload.get("n-samples")
-        or expected_payload.get("n_samples")
-        or {}
-    )
-    original = int((counts.get(task) or {}).get("original", len(rows)))
-    pool = PoolSpec(
-        name="lmms-merge-check",
-        backend="lmms_eval",
-        entry="",
-        launcher="local",
-        volc={},
-        env={},
-        local_python=str(python),
-        max_workers=1,
-        worker_max_wall_seconds=300,
-        worker_idle_exit_seconds=30,
-        extra={"lmms_root": str(root), "column": "check"},
-    )
-    with tempfile.TemporaryDirectory(
-        prefix="shardq-lmms-merge-"
-    ) as directory:
-        work = Path(directory)
-        records_file = work / "records.jsonl"
-        records_file.write_text(
-            "".join(
-                json.dumps(row, ensure_ascii=False) + "\n" for row in rows
-            ),
-            encoding="utf-8",
-        )
-        run_backend_op(
-            pool,
-            "merge",
-            {
-                "backend": "lmms_eval",
-                "backend_args": {
-                    "tasks": [task],
-                    "model": "",
-                    "bootstrap_iters": 0,
-                },
-                "pool": pool.snapshot(),
-                "pins": {
-                    "lmms_root": str(root),
-                    "lmms_commit": proc.stdout.strip(),
-                },
-                "partition": {
-                    "name": task,
-                    "size": original,
-                    "traits": {},
-                },
-                "records_file": str(records_file),
-                "out_dir": str(work / "merged"),
-                "meta": {"shards_used": []},
-            },
-        )
-        actual_payload = json.loads(
-            (work / "merged" / "results.json").read_text(encoding="utf-8")
-        )
-    expected = _public_scalars(expected_payload["results"][task])
-    actual = _public_scalars(actual_payload["results"][task])
-    diffs = {}
-    for key in sorted(set(expected) | set(actual)):
-        left = expected.get(key)
-        right = actual.get(key)
-        if (
-            isinstance(left, (int, float))
-            and not isinstance(left, bool)
-            and isinstance(right, (int, float))
-        ):
-            if abs(float(left) - float(right)) < 1e-9:
-                continue
-            delta = float(right) - float(left)
-        else:
-            if left == right:
-                continue
-            delta = None
-        diffs[key] = {
-            "expected": left,
-            "actual": right,
-            "delta": delta,
-        }
-    return {"task": task, "match": not diffs, "diffs": diffs}
+    return check(samples_path, results_path, lmms_root, local_python)
 
 
 def _publish(root: Path, job_id: str, out_dir: Path) -> dict:
@@ -253,8 +125,10 @@ def _publish(root: Path, job_id: str, out_dir: Path) -> dict:
         _atomic_copy(marker, target_markers / marker.name)
 
     artifacts = []
+    missing_ids = {}
     for name in sorted(job.partitions):
         merged = ledger.job_dir(job_id) / "merged" / name
+        missing_ids[name] = read_json(merged / "merge.json")["missing_units"]
         row = {"partition": name}
         for kind in ("results", "records"):
             path = (
@@ -284,8 +158,10 @@ def _publish(root: Path, job_id: str, out_dir: Path) -> dict:
         else "complete"
     )
     run_id = run_dir.name
+    report = report_for_job(job.spec)
     run_payload = {
-        "schema_version": 1,
+        **report.get("run", {}),
+        "schema_version": 2 if "backend_report" in job.spec else 1,
         "kind": "shardq",
         "run_id": run_id,
         "status": status,
@@ -296,10 +172,9 @@ def _publish(root: Path, job_id: str, out_dir: Path) -> dict:
         "protocol_by_column": {job.column: job.spec["protocol_id"]},
         "queue": source.get("queue"),
         "execution_source": source,
-        "canonical_lmms_root": pins.get("lmms_root"),
         "source_revisions": {
+            **report.get("source_revisions", {}),
             "control_commit": pins.get("control_commit"),
-            "canonical_lmms_tree": pins.get("lmms_commit"),
             "shardq_version": pins.get("shardq_version"),
         },
         "shardq_job": job_id,
@@ -320,10 +195,8 @@ def _publish(root: Path, job_id: str, out_dir: Path) -> dict:
             "status": (
                 "accepted" if status == "complete" else "data_gap"
             ),
-            "missing_units": {
-                name: job.partitions[name].quarantined_units
-                for name in job.partitions
-            },
+            "missing_units": {name: len(ids) for name, ids in missing_ids.items()},
+            "missing_unit_ids": missing_ids,
         },
     )
     atomic_write_text(
@@ -581,35 +454,9 @@ def main(argv: List[str] = None) -> int:
             return 0
 
         if args.command == "lmms-merge-check":
-            config_root = (
-                _root(args.root)
-                if args.root or os.environ.get("SHARDQ_ROOT")
-                else Path.cwd()
-            )
-            lmms_root = args.lmms_root
-            local_python = args.local_python
-            if args.pool:
-                pools_path = resolve_pools_path(args.pools, config_root)
-                pools = load_pools(pools_path)
-                if args.pool not in pools:
-                    raise ValueError(f"unknown pool: {args.pool}")
-                pool = pools[args.pool]
-                lmms_root = lmms_root or pool.extra.get("lmms_root")
-                local_python = local_python or pool.local_python
-            if lmms_root is None:
-                raise ValueError(
-                    "lmms root is not set; pass --lmms-root or --pool"
-                )
-            if local_python is None:
-                raise ValueError(
-                    "local python is not set; pass --local-python or --pool"
-                )
-            report = lmms_merge_check(
-                args.samples,
-                args.results,
-                Path(lmms_root),
-                Path(local_python),
-            )
+            from .backends.lmms_reports import check_from_cli
+
+            report = check_from_cli(args)
             print(json.dumps(report, ensure_ascii=False, sort_keys=True))
             return 0 if report["match"] else 1
 

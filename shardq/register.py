@@ -82,13 +82,6 @@ def register(
     )
     pins["shardq_version"] = __version__
 
-    operation_pins = dict(pins)
-    if (
-        dry_run
-        and pin_mode == "worktree"
-        and operation_pins.get("lmms_source_root")
-    ):
-        operation_pins["lmms_root"] = operation_pins["lmms_source_root"]
     backend_payload = {
         "backend": spec.backend,
         "backend_args": spec.backend_args,
@@ -96,8 +89,9 @@ def register(
         "pins": pins,
     }
     if sizes is None:
-        described = run_backend_op(pool, "describe", {**backend_payload, "pins": operation_pins})
+        described = run_backend_op(pool, "describe", {**backend_payload, "dry_run": dry_run})
         partition_rows = described["partitions"]
+        session_key = str(described["session_key"])
     else:
         partition_rows = [
             {
@@ -109,9 +103,6 @@ def register(
             for name, size in sizes.items()
         ]
 
-    if sizes is None and operation_pins == pins:
-        session_key = str(described["session_key"])
-    else:
         session_key = str(run_backend_op(pool, "session_key", backend_payload)["session_key"])
 
     names = [str(row["name"]) for row in partition_rows]
@@ -140,6 +131,7 @@ def register(
             "spec_sha256": hashlib.sha256(spec_path.read_bytes()).hexdigest(),
         }
     )
+    job_payload["backend_report"] = backend_class.report_metadata(job_payload)
     if dry_run:
         return job_payload
 

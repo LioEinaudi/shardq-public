@@ -11,6 +11,7 @@ from typing import List, Optional, Tuple
 
 from ..ledger import atomic_write_json
 from ..spec import PoolSpec
+from .lmms_reports import LmmsReports
 from .base import (
     Backend, Partition, RangeResult, RangeValidationError, WorkerRestartRequired,
     session_fingerprint, validate_unit_ids,
@@ -131,7 +132,7 @@ class _LmmsSession:
         self.task_manager = None
 
 
-class LmmsEvalBackend(Backend):
+class LmmsEvalBackend(LmmsReports, Backend):
     name = "lmms_eval"
     _session_source: Optional[Tuple[Path, Optional[str]]] = None
 
@@ -329,6 +330,20 @@ class LmmsEvalBackend(Backend):
             raise ValueError(f"tasks not found in canonical lmms-eval: {missing}")
         outputs = get_task_list(get_task_dict(matched, task_manager=manager))
         return manager, outputs
+
+    @classmethod
+    def control_pythonpath(cls, pool: PoolSpec, pins: dict) -> Tuple[str, ...]:
+        # Cached modules from another pinned revision cannot be replaced by changing sys.path.
+        root = pins.get("lmms_root")
+        return (str(root),) if root else ()
+
+    def preview_describe(self) -> List[Partition]:
+        if self.pins.get("pin_mode") != "worktree":
+            return self.describe()
+        # The future worktree may not exist. Inspect the source checkout while
+        # retaining the final worktree path for this job's effective session key.
+        preview = dict(self.pins, lmms_root=self.pins["lmms_source_root"])
+        return type(self)(self.backend_args, self.pool, preview).describe()
 
     def describe(self) -> List[Partition]:
         if not self.tasks:

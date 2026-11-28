@@ -172,6 +172,17 @@ shardq lmms-merge-check \
 
 ## Extension points
 
+[Adapter contract and compatibility](docs/extensions.md) ·
+[Python Backend with a reusable session](examples/python_backend/) ·
+[External Launcher](examples/external_launcher/)
+
+New registrations freeze backend reporting metadata alongside source pins.
+New jobs write version 2 markers and `run.json` with common fields for every
+backend and optional backend reporting fields. lmms retains its original
+top-level marker parameters, revision and import proof. Jobs registered before
+this change still export version 1 markers and runs. The ledger, worker,
+attempt and pool formats accept the previous files in place.
+
 A backend subclasses `shardq.backends.base.Backend`, implements the existing
 describe/session/validate/merge contract, and may implement the class-level
 `pins` hook. Select it with `module:Class` in a pool. The built-in `script`

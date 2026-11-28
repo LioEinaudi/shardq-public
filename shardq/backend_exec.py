@@ -23,7 +23,7 @@ def execute_backend_op(op: str, payload: dict) -> dict:
     if op == "session_key":
         return {"session_key": backend.session_key()}
     if op == "describe":
-        partitions = backend.describe()
+        partitions = backend.preview_describe() if payload.get("dry_run") else backend.describe()
         return {
             "partitions": [
                 {
@@ -60,11 +60,12 @@ def run_backend_op(pool: PoolSpec, op: str, payload: dict) -> dict:
     envelope.setdefault("pool", pool.snapshot())
     envelope.setdefault("pins", {})
     python = pool.local_python or sys.executable
-    lmms_root = (envelope.get("pins") or {}).get("lmms_root")
-    # lmms source pins can change between jobs; sys.path cannot replace cached modules.
-    # A virtualenv may symlink its executable to the control interpreter.
-    if (not lmms_root and envelope["backend"] != "lmms_eval"
-            and os.path.abspath(python) == os.path.abspath(sys.executable)):
+    backend = get_backend(envelope["backend"])
+    import_roots = backend.control_pythonpath(pool, envelope["pins"])
+    if import_roots is not None and not isinstance(import_roots, (tuple, list)):
+        raise TypeError(f"{envelope['backend']} control_pythonpath must return import roots or None")
+    # A virtual environment can symlink its executable to the control interpreter.
+    if import_roots is None and os.path.abspath(python) == os.path.abspath(sys.executable):
         return execute_backend_op(op, envelope)
     temporary = tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", suffix=".json", prefix="shardq-backend-", delete=False
@@ -75,9 +76,7 @@ def run_backend_op(pool: PoolSpec, op: str, payload: dict) -> dict:
         temporary.close()
         env = dict(os.environ)
         package_root = Path(__file__).resolve().parent.parent
-        paths = [str(package_root)]
-        if lmms_root:
-            paths.append(str(lmms_root))
+        paths = [str(package_root), *(str(path) for path in import_roots or ())]
         if env.get("PYTHONPATH"):
             paths.append(env["PYTHONPATH"])
         env["PYTHONPATH"] = os.pathsep.join(paths)
