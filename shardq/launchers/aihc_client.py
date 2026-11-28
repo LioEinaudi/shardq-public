@@ -6,7 +6,7 @@ import subprocess
 import time
 from typing import List
 
-from .base import TransientSubmitError
+from .base import CommandError, TransientSubmitError
 
 
 TERMINAL = {
@@ -20,18 +20,13 @@ TERMINAL = {
     "Deleted",
     "Timeout",
 }
-TRANSIENT_MARKERS = (
-    "flow control",
-    "quota",
-    "too many requests",
-    "rate limit",
-    "限流",
-    "配额",
-    "429",
-)
+# These complete creation rejection messages have fixtures. Mixed CLI output
+# can include throttling of a follow-up request after a successful creation.
+CREATE_REJECTIONS = {"server rejected request: rate limit 429", "aihc quota exceeded"}
 SUBMIT_RETRIES = 5
-_JOB_ID_PATTERN = re.compile(r"job-[a-z0-9]+")
-_STATUS_PATTERN = re.compile(r"(?m)^    status: (\S+)\s*$")
+_JOB_ID_PATTERN = re.compile(r"\bjob-[a-z0-9]+\b")
+_CREATE_RECEIPT = re.compile(r"^(?:(?:successfully )?created (?:job:?[ ]+)?)?(job-[a-z0-9]+)[.]?$", re.M)
+_JOB_DETAILS = re.compile(r"^openapigetjobresponseresult:[ \t]*\n((?:[ \t][^\n]*(?:\n|$)|\n)*)", re.M)
 
 
 def _run_output(
@@ -51,9 +46,7 @@ def _run_output(
         timeout=timeout,
     )
     if proc.returncode:
-        raise RuntimeError(
-            f"{' '.join(command)} failed ({proc.returncode}): {proc.stdout[-2000:]}"
-        )
+        raise CommandError(" ".join(command), proc.returncode, proc.stdout)
     return proc.stdout
 
 
@@ -88,20 +81,22 @@ def create_job(
             output = _run_output(
                 args, binary=binary, config_file=config_file, timeout=180
             )
-            lowered = output.lower()
-            ids = set(_JOB_ID_PATTERN.findall(lowered))
-            if "error:" in lowered or "创建失败" in output or len(ids) != 1:
-                raise RuntimeError(
-                    f"cannot parse one AIHC job id from submission output: {output[-2000:]}"
-                )
-            return next(iter(ids))
         except RuntimeError as exc:
-            lowered = str(exc).lower()
-            if not any(marker in lowered for marker in TRANSIENT_MARKERS):
+            response = exc.output if isinstance(exc, CommandError) else str(exc)
+            if response.strip().lower() not in CREATE_REJECTIONS:
                 raise
             if attempt == SUBMIT_RETRIES:
                 raise TransientSubmitError(str(exc)) from exc
             time.sleep(random.uniform(1.0, 3.0) * attempt)
+        else:
+            lowered = output.lower()
+            ids = set(_JOB_ID_PATTERN.findall(lowered))
+            if ("error:" in lowered or "创建失败" in output or len(ids) != 1
+                    or not _CREATE_RECEIPT.search(lowered.strip())):
+                raise RuntimeError(
+                    f"cannot parse one AIHC job id from submission output: {output[-2000:]}"
+                )
+            return ids.pop()
     raise AssertionError("unreachable")
 
 
@@ -118,10 +113,16 @@ def get_job_status(
         binary=binary,
         config_file=config_file,
     )
-    match = _STATUS_PATTERN.search(output)
-    if not match:
-        raise RuntimeError("cannot parse status")
-    return match.group(1)
+    blocks = _JOB_DETAILS.findall(output)
+    if len(blocks) != 1:
+        raise RuntimeError("expected one AIHC job details block")
+    ids = re.findall(r"^    jobid:[ \t]*(.*)$", blocks[0], re.M)
+    if ids and [value.strip() for value in ids] != [job_id]:
+        raise RuntimeError(f"AIHC job identity does not match {job_id}")
+    statuses = re.findall(r"^    status:[ \t]*(.*)$", blocks[0], re.M)
+    if len(statuses) != 1 or not re.fullmatch(r"\S+", statuses[0].strip()):
+        raise RuntimeError("cannot parse a unique AIHC job status")
+    return statuses[0].strip()
 
 
 def stop_job(

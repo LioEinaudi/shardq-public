@@ -79,10 +79,40 @@ shows the job's setup state, failure count and next retry time. ShardQ waits
 continue. Fix the environment and run `shardq resume --job JOB` to start a new
 setup budget with the original partition ranges and attempt history.
 
+**Interrupted worker submissions.** Before contacting a launcher, the scheduler
+records a worker ID and reserves capacity in `workers/<worker_id>.json`.
+Restart the scheduler with the same ledger, pools file and provider account.
+It resumes unused intents and reconciles calls that may have reached the
+platform. An unresolved request keeps its pool slot and keeps
+`--exit-when-idle` waiting. A worker may start and renew leases while its
+submit acknowledgement is still in flight.
+
+`shardq status --json` shows the request ID, submission state, observed
+worker starts, errors, and the next reconciliation time. Linux local workers
+can be identified from their startup receipts. Volc and AIHC currently need
+operator evidence when the create acknowledgement is lost. Inspect the
+original queue/account and task history, including finished tasks. Stop the
+scheduler before recording a verified outcome, for example:
+
+```bash
+shardq resolve-submission --worker-id "$WORKER_ID" --handle "$HANDLE" --evidence "$PROVIDER_EVIDENCE"
+```
+
+Use `--not-created` only with positive evidence that creation was rejected
+and no call can still create the task. Use `--terminal` when every possible
+matching task has finished. For multiple matches, binding one requires
+`--terminal-match HANDLE` for each other verified terminal task and supporting
+evidence. Restart the scheduler after resolution. A temporarily empty listing
+or missing worker heartbeat leaves the reservation in place.
+[Submission states, resource accounting and operator recovery](docs/design.md#worker-submission-recovery)
+
 For an existing ledger, stop the old scheduler and drain old workers, including
 queued submissions, before starting the upgraded writers. Existing pools,
 snapshots, jobs and attempts can be used in place. Workers recompute session
 compatibility, including the actual Script `run_command`, on each claim.
+Legacy worker rows with a handle continue to be polled. Before cutover,
+reconcile any old cloud calls that may have created a task without recording
+a handle. The new protocol starts with requests created by the upgraded scheduler.
 
 Use a POSIX shared filesystem with coherent cross-host `flock`, symbolic links
 and atomic same-directory file rename. A worker publishes a fully initialized
@@ -130,7 +160,9 @@ backend is convenient for command-line adapters.
 
 A cloud launcher subclasses `shardq.launchers.base.Launcher` and implements
 `submit`, `status`, and `kill`; implement `capacity_slots` when the cloud
-has auditable capacity. Add its name to `shardq.launchers.get_launcher`.
+has auditable capacity. A launcher with complete request history can implement
+`lookup_submission` for automatic recovery. Add its name to
+`shardq.launchers.get_launcher`.
 
 ## Agent skill
 
