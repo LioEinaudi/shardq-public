@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Iterable, List, Set
 
 from .backend_exec import run_backend_op
-from .fs import atomic_output
+from .fs import write_records
 from .ledger import JobView, Ledger, PartitionView, ShardState, atomic_write_json, read_json
 from .spec import PoolSpec
 
@@ -72,12 +72,6 @@ def coverage(records: List[dict], size: int, quarantined_units: Set[int]) -> dic
     }
 
 
-def _write_records(path: Path, rows: List[dict]) -> None:
-    with atomic_output(path) as temporary, temporary.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
-
-
 def _parse_generation_kwargs(value: object) -> dict:
     if isinstance(value, dict):
         return dict(value)
@@ -136,13 +130,18 @@ def merge_partition(
         raise ValueError(f"partition {partition} is missing {len(missing)} units: {missing[:20]}")
     out_dir = job_dir / "merged" / partition
     records_file = out_dir / "records.jsonl"
-    _write_records(records_file, records)
+    records_sha256 = write_records(records_file, records)
+    completed = view.size - len(missing)
     backend_meta = {
         "job_id": job.job_id,
         "partition": partition,
         "shards_used": selected,
         "missing_units": missing,
         "quarantined_shards": quarantined_shards,
+        "expected_units": view.size,
+        "completed_units": completed,
+        "record_count": len(records),
+        "artifacts": {"records": {"path": str(records_file.resolve()), "sha256": records_sha256}},
     }
     backend_result = run_backend_op(
         pool,
@@ -176,7 +175,9 @@ def merge_partition(
         "job_id": job.job_id,
         "partition": partition,
         "size": view.size,
-        "effective": len({row["unit_id"] for row in records}),
+        "effective": completed,
+        "record_count": len(records),
+        "artifacts": backend_meta["artifacts"],
         "missing_units": missing,
         "quarantined_shards": quarantined_shards,
         "shards_used": public_selected,

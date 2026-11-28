@@ -1,7 +1,8 @@
 # ShardQ
 
-ShardQ is a filesystem-backed scheduler for cutting benchmark partitions into
-short, retryable ranges. Its core has no third-party runtime dependencies.
+ShardQ runs recoverable offline batches on a shared POSIX filesystem. It cuts
+known-size partitions into retryable integer ranges, manages leases and checks
+the merged output. A backend supplies the work and a launcher runs workers. Its core has no third-party runtime dependencies.
 `lmms-eval` is an optional backend loaded only when that backend runs.
 
 ## Install
@@ -14,6 +15,21 @@ shardq --help
 ```
 
 Python 3.9 or newer is required.
+
+## Run a batch script
+
+The [manifest example](examples/manifest_script/) computes file information for
+each manifest entry with the Python standard library. A Script job supplies
+partition sizes (or a discovery command) and a range command. Each invocation
+writes one JSON object per assigned index to `$SHARDQ_OUT_DIR/records.jsonl`.
+The default merge publishes the verified records and a `results.json` summary in
+`jobs/<job>/merged/<partition>/`. It reports record count, completed unique
+units, missing indices and the records SHA-256. A terminal partition with zero
+valid records publishes empty JSONL and reports every index missing.
+
+Set `merge_command` for domain-specific aggregation. For a model that should
+stay loaded across ranges, use a Python Backend session. Script starts a new
+subprocess for every range.
 
 ## Five-minute fake demo
 

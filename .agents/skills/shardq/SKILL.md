@@ -130,8 +130,8 @@ Order of checks when something looks stuck:
 Any benchmark that can run a contiguous index range from a command line works through the
 built-in `script` backend without writing Python: `run_command` gets
 `SHARDQ_PARTITION`, `SHARDQ_START`, `SHARDQ_COUNT`, `SHARDQ_OUT_DIR` and must write
-`records.jsonl` with integer `unit_id`s covering exactly that range; `merge_command`
-turns the deduplicated records into `results.json`. Full contract and a worked example:
+`records.jsonl` with integer `unit_id`s covering exactly that range. The default summary records coverage and artifact identity. Optional `merge_command`
+produces a custom `results.json`. Full contract and a worked example:
 `references/script-backend.md`. When model loading dominates, write a Python `Backend`
 whose `open_session` loads once per worker (`docs/design.md`, "Adding a backend").
 

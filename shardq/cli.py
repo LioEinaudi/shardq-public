@@ -345,18 +345,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="shardq")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    register_parser = commands.add_parser("register")
+    register_parser = commands.add_parser("register", help="register a batch job and its partitions")
     register_parser.add_argument("spec", type=Path)
     _add_config_args(register_parser)
-    register_parser.add_argument(
+    registration = register_parser.add_argument_group("source pinning and partition overrides")
+    registration.add_argument(
         "--pin-mode",
         choices=["worktree", "verify"],
         default="worktree",
     )
-    register_parser.add_argument("--sizes", nargs="*")
+    registration.add_argument("--sizes", nargs="*")
     register_parser.add_argument("--dry-run", action="store_true")
 
-    scheduler = commands.add_parser("scheduler")
+    scheduler = commands.add_parser("scheduler", help="execute registered jobs using their pools")
     _add_config_args(scheduler)
     scheduler.add_argument(
         "--launcher", metavar="NAME",
@@ -365,8 +366,9 @@ def build_parser() -> argparse.ArgumentParser:
     scheduler.add_argument("--poll-seconds", type=int, default=60)
     scheduler.add_argument("--once", action="store_true")
     scheduler.add_argument("--exit-when-idle", action="store_true")
-    scheduler.add_argument("--max-submits-per-tick", type=int, default=4)
-    scheduler.add_argument("--max-cuts-per-tick", type=int, default=64)
+    tuning = scheduler.add_argument_group("advanced scheduling limits")
+    tuning.add_argument("--max-submits-per-tick", type=int, default=4)
+    tuning.add_argument("--max-cuts-per-tick", type=int, default=64)
     scheduler.add_argument("--require-complete", action="store_true")
 
     worker = commands.add_parser("worker")

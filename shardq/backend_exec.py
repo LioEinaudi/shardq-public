@@ -13,10 +13,6 @@ from .backends.base import Partition
 from .spec import PoolSpec
 
 
-def _load_records(path: Path) -> list:
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-
-
 def execute_backend_op(op: str, payload: dict) -> dict:
     backend_class = get_backend(str(payload["backend"]))
     backend = backend_class(
@@ -48,10 +44,9 @@ def execute_backend_op(op: str, payload: dict) -> dict:
             unit_seconds_hint=row.get("unit_seconds_hint"),
             traits=dict(row.get("traits") or {}),
         )
-        records = _load_records(Path(payload["records_file"]))
-        return backend.merge(
+        return backend.merge_file(
             partition,
-            records,
+            Path(payload["records_file"]),
             Path(payload["out_dir"]),
             dict(payload.get("meta") or {}),
         )

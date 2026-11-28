@@ -18,12 +18,12 @@ range on request and emit one record per index.
   `unit_id`, and the set of `unit_id`s must equal exactly
   `range(SHARDQ_START, SHARDQ_START + SHARDQ_COUNT)`. Any other keys are the adapter's
   own (prediction, score, timing). Extra files may go under `$SHARDQ_OUT_DIR`.
-- `merge_command`: shell command executed once per partition with `SHARDQ_PARTITION`,
+- `merge_command` (optional): shell command executed once per partition with `SHARDQ_PARTITION`,
   `SHARDQ_OUT_DIR`, `SHARDQ_RECORDS` (the deduplicated, coverage-checked
   `records.jsonl`), `SHARDQ_META` (`meta.json` with the shards used). It must write
   `$SHARDQ_OUT_DIR/results.json` shaped as
   `{"results": {"<partition>": {"<metric>": value, ...}}}`; ShardQ copies the partition's
-  metrics into `merge.json` and the marker.
+  metrics into the backend reply. The published results file retains the command output.
 - `session_key` is an optional grouping label, defaulting to `any`. The execution
   key fingerprints the Script backend, this label and the exact `run_command`.
   Identical commands and labels can reuse the session wrapper. Every range still
@@ -40,7 +40,17 @@ Model loading happens inside `run_command` every time. Size shards with
 model as a local server the command talks to, or implement a Python `Backend` with
 `open_session` when a persistent process is needed.
 
-## Worked example
+## Default summary
+
+Without a merge command, the core publishes the deduplicated UTF-8
+`records.jsonl`. The adjacent `results.json` contains `schema_version: 1`,
+`job_id`, `partition`, `status` (complete or partial), `expected_units`,
+`completed_units` (unique indices), `record_count`, sorted `missing_units`,
+and `artifacts.records` with the absolute `path` and `sha256`. All-quarantined
+partitions produce an empty records file and a partial summary. See
+[the manifest batch](../../../../examples/manifest_script/) for runnable commands.
+
+## Custom aggregation example
 
 `adapter.sh` (must be executable and visible to the worker at this absolute path):
 

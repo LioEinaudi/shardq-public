@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 from uuid import uuid4
 
 
@@ -46,3 +47,13 @@ def atomic_write_text(path: Path, content: str) -> None:
 
 def atomic_write_json(path: Path, payload: Any) -> None:
     atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+def write_records(path: Path, rows: Iterable[dict]) -> str:
+    """Publish UTF-8 JSONL and hash exactly the bytes written."""
+    digest = hashlib.sha256()
+    with atomic_output(path) as temporary, temporary.open("wb") as output:
+        for row in rows:
+            line = (json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+            output.write(line)
+            digest.update(line)
+    return digest.hexdigest()

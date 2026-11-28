@@ -1,0 +1,10 @@
+{
+  "job_id": "file-hashes",
+  "backend": "script",
+  "pool": "cpu",
+  "protocol_id": "file-sha256-v1",
+  "backend_args": {
+    "partitions": {"files": 3},
+    "run_command": "python3 \"$FILE_TASK_DIR/hash_files.py\""
+  }
+}

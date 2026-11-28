@@ -94,6 +94,12 @@ class Backend(ABC):
     def merge(self, partition: Partition, records: List[dict], out_dir: Path, meta: dict) -> dict:
         raise NotImplementedError
 
+    def merge_file(self, partition: Partition, records_file: Path, out_dir: Path, meta: dict) -> dict:
+        """Aggregate the published, coverage-checked JSONL. Existing backends receive a list."""
+        with records_file.open(encoding="utf-8") as handle:
+            records = [json.loads(line) for line in handle if line.strip()]
+        return self.merge(partition, records, out_dir, meta)
+
     def traits(self, partition: str) -> dict:
         return {}
 
